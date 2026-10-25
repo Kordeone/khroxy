@@ -1,5 +1,6 @@
-# v0.9: reproducible-ish developer tooling image, built by guided setup.py.
-# Build-time package downloads use Podman build networking, NOT the runtime proxy.
+# v0.9.1: guided rootless Podman developer tooling image.
+# Build-time apt/npm/git downloads use the explicitly forwarded native khroxy
+# HTTP proxy via rootless pasta TCP port forwarding; runtime rules stay separate.
 FROM node:24-trixie-slim
 ARG AGENT_UID=1000
 ARG CODEX_VERSION=0.164.0

@@ -1,6 +1,6 @@
-# khroxy v0.9 — rootless Podman AI workspace
+# khroxy v0.9.1 — rootless Podman AI workspace
 
-This release swaps khroxy's **Docker Compose** workspace preview for **rootless Podman**. It requires **no Docker daemon, Docker CLI, Docker Compose, or rootful Podman**.
+This release uses **rootless Podman**, with a repair for build-time npm downloads through the existing native khroxy proxy. It requires **no Docker daemon, Docker CLI, Docker Compose, or rootful Podman**.
 
 The native khroxy Python TUI and CLI are unchanged: four full-screen views (Profiles, Applications, Subscriptions, Logs), `?` for scrollable keybindings, `*` for the active profile, testing and fastest profile selection. Your native profiles and subscriptions are not moved, deleted, or copied to the container.
 
@@ -35,7 +35,7 @@ sudo apt install podman passt uidmap
 
 This is a **manual** host package installation. The setup script never runs `sudo`, changes AppArmor/firewall/SSH, installs packages, or unmasks services. Rootless Podman needs working subordinate UID/GID mapping. The installer validates Podman is rootless before building.
 
-Unpack ZIP and enter the `khroxy-v0.9` folder. Preview changes with a project path (any existing owned projects directory):
+Unpack ZIP and enter the `khroxy-v0.9.1` folder. Preview changes with a project path (any existing owned projects directory):
 
 ```sh
 python3 setup.py --projects /mnt/storage/Projects --dry-run
@@ -47,7 +47,16 @@ Run the interactive installer to **choose the actual path during installation**:
 python3 setup.py
 ```
 
-The installer shows the path and available Xray binary, stages its own copy, and *asks* if you want to build and later start. It refuses to replace a container with the same name. `--configure-only` is safe when Podman is not installed; `--build` builds but doesn't start. `--start` still requires typing `YES`.
+The installer shows the path and available Xray binary, stages its own copy, and *asks* if you want to build and later start. Before the build, it checks that the host khroxy listener can fetch Codex from npm and that a temporary Podman container can reach that listener over the *same isolated pasta mapping*. It will stop early if either check fails, without attempting a direct build fallback.
+
+**Important: the build uses the existing host khroxy proxy, not port 20819 inside the not-yet-built container.** The default build proxy is `127.0.0.1:20820`, which you previously configured for Codex on Debian. If your actual listener differs, use `--build-proxy-port PORT`:
+
+```sh
+khroxy test codex                # confirm existing native khroxy profile works
+python3 setup.py --build-proxy-port 20820
+```
+
+The image does not need to be manually cleaned after a failed npm step: `podman build` reuses completed build layers. Do not use `--network=host`, copy host `~/.codex`, or disable runtime isolation to repair build downloads. It refuses to replace a container with the same name. `--configure-only` is safe when Podman is not installed; `--build` builds but doesn't start. `--start` still requires typing `YES`.
 
 Start requires a valid Xray binary, Podman rootless preflight, separate Podman network namespace, and a container firewall policy that defaults to **DROP** for IPv4 and IPv6. A failed guard or failed bypass smoke test stops the container without deleting the persistent volumes.
 
@@ -77,10 +86,11 @@ Inside the TUI, import/select a profile and start the gateway. The host proxy at
 - Only the setup script's private network configuration has been coded and unit tested; **live Podman, iptables and DNS/UDP tests are still required** before using this for untrusted agents.
 - The container's AI tools use proxy environment variables. Applications that ignore proxy settings are blocked from public Internet, **not transparently forwarded**.
 - No Docker socket or host Podman socket is mounted; no Debian home mount, no trust-LAN allowlist by default; the only host data mount is the selected projects directory.
-- The build downloads base image/npm/Caveman sources using build-time networking. Build happens *outside* the protected runtime proxy and must be reviewed separately; dependencies are pinned to declared versions/refs but not cryptographic digests.
+- The build uses your existing native khroxy HTTP proxy (default `127.0.0.1:20820`) for apt/npm/git downloads. Rootless `pasta:-T,20820` forwards only that selected local TCP port to build steps. The Podman base-image pull may still use ordinary host registry access; build networking is **not** the runtime kill switch. Dependencies are pinned to declared versions/refs but not cryptographic digests.
 
 ## Troubleshooting
 
+- **npm `FETCH_ERROR` or timeout during image build:** Use v0.9.1 and check `khroxy test codex`, then rerun `python3 setup.py --build-proxy-port 20820`. If the preflight fails, verify the selected host proxy listener; no need to reinstall Podman.
 - **Missing Podman:** The script prints a manual Debian install command; it will not install Podman automatically.
 - **Rootful Podman:** Rejected. Run as your normal Debian user without `sudo`.
 - **Unable to set iptables/ip6tables inside rootless Podman:** Startup fails; do **not** bypass the guard, add `--privileged`, or use host networking. Check kernel/netfilter availability and Podman networking before any further changes.

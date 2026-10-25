@@ -1,0 +1,5 @@
+{
+  "projects": "/mnt/storage/Projects",
+  "uid": 1000,
+  "engine": "podman"
+}

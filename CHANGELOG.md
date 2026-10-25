@@ -1,14 +1,14 @@
 # Changelog
 
-## 0.9 — Rootless Podman conversion (October 2026)
+## v0.9.1 — rootless Podman build-proxy repair
 
-- Switched the workspace installer from Docker Compose to **Podman directly** (`podman build/run/exec`). No Docker or Compose required.
-- Kept the exact four-screen khroxy TUI and its keybindings.
-- Kept the setup-time prompt for the host projects folder, mounted read/write at `/workspace` using rootless Podman `--userns=keep-id`.
-- Preserved one combined container with Node 24, npm/npx, Codex, Caveman/Ultracave, Xray, and separate persistent Codex and khroxy volumes.
-- Restricted proxy publication to host `127.0.0.1:20819`; rootless `pasta` for runtime network, no host network mode.
-- Replaced Docker-specific `eth0@if` guard with Podman marker plus a host-vs-container network namespace check before firewall changes.
-- Added rootless preflight, no automatic Podman install, explicit start authorization, and container isolation smoke checks.
-- Offline verified; **live Podman networking and kill-switch checks remain outstanding.**
+- Fixed container image npm download timeout by routing build-time package downloads through an existing native khroxy HTTP proxy (default `127.0.0.1:20820`).
+- Rootless `pasta:-T,PORT` forwards only the build proxy port; **no `--network=host`**.
+- Probes the npm registry through the host proxy and tests Podman-to-host proxy TCP connectivity before a costly image build. Both checks fail early and never fall back to direct access.
+- Build proxy settings are scoped to the `podman build` process; runtime `podman run` and the AI isolation policy are unchanged.
+- Supports choosing a different build proxy via `python3 setup.py --build-proxy-port PORT`.
+- Added regression tests for proxy routing, failure handling, network boundaries, and port validation.
 
-See older v0.8 packages for prior release history.
+## v0.9 — Podman container
+
+Rootless Podman replacement for the Docker Compose workspace, preserving the four-screen khroxy TUI, Codex, Ultracave, separate auth volume, projects mount, and fail-closed runtime guard. Live network isolation remains unverified.

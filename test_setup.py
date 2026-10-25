@@ -49,25 +49,97 @@ class SetupTests(unittest.TestCase):
 
     def test_podman_build_command_and_no_compose(self):
         cmds=[]
-        with patch.object(setup,'preflight_podman',return_value='5.0'),patch.object(setup,'run',side_effect=lambda c,**kw:cmds.append(c)):
+        with patch.object(setup,'preflight_podman',return_value='5.0'),\
+             patch.object(setup,'preflight_build_proxy'),\
+             patch.object(setup,'preflight_podman_build_proxy'),\
+             patch.object(setup,'run',side_effect=lambda c,**kw:cmds.append(c)):
             self.assertEqual(self.call('--build'),0)
         self.assertEqual(len(cmds),1)
         self.assertEqual(cmds[0][:2],['podman','build'])
         self.assertIn('AGENT_UID=1000',cmds[0])
         self.assertNotIn('compose',str(cmds).lower())
 
+    def test_build_uses_proxy_only_in_isolated_pasta_network(self):
+        cmd=setup.build_command(1000,20820)
+        self.assertIn('--network=pasta:-T,20820',cmd)
+        self.assertIn('--http-proxy=true',cmd)
+        self.assertNotIn('--network=host',cmd)
+        env=setup.build_proxy_env(20820)
+        for name in ('HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','http_proxy','https_proxy','all_proxy'):
+            self.assertEqual(env[name],'http://127.0.0.1:20820')
+        self.assertEqual(env['NO_PROXY'],'localhost,127.0.0.1,::1')
+        self.assertEqual(env['no_proxy'],'localhost,127.0.0.1,::1')
+        self.assertNotIn('20820',str(setup.start_command(self.projects,'net:[123]')))
+
+    def test_build_preflight_failure_never_runs_podman_build(self):
+        cmds=[]
+        with patch.object(setup,'preflight_podman',return_value='5.4.2'),\
+             patch.object(setup,'preflight_build_proxy',side_effect=setup.SetupError('no proxy')) ,\
+             patch.object(setup,'run',side_effect=lambda c,**kw:cmds.append(c)):
+            self.assertEqual(self.call('--build'),1)
+        self.assertEqual(cmds,[])
+
+    def test_podman_build_preflight_failure_prevents_build(self):
+        cmds=[]
+        with patch.object(setup,'preflight_podman',return_value='5.4.2'),\
+             patch.object(setup,'preflight_build_proxy'),\
+             patch.object(setup,'preflight_podman_build_proxy',side_effect=setup.SetupError('bridge inaccessible')) ,\
+             patch.object(setup,'run',side_effect=lambda c,**kw:cmds.append(c)):
+            self.assertEqual(self.call('--build'),1)
+        self.assertEqual(cmds,[])
+
+    def test_invalid_build_port(self):
+        for p in ('0','65536','-1'):
+            with self.subTest(port=p):
+                self.assertEqual(self.call('--dry-run','--build-proxy-port',p),1)
+        with self.assertRaises(setup.SetupError):
+            setup.build_command(1000,0)
+
+    def test_host_proxy_registry_preflight_uses_explicit_proxy(self):
+        p=CompletedProcess([],0,stdout='200')
+        with patch.object(setup.shutil,'which',return_value='/usr/bin/curl'),\
+             patch.object(setup.subprocess,'run',return_value=p) as runner:
+            setup.preflight_build_proxy(20820)
+        args=runner.call_args.args[0]
+        self.assertIn('--noproxy',args)
+        self.assertEqual(args[args.index('--proxy')+1],'http://127.0.0.1:20820')
+        self.assertIn('https://registry.npmjs.org/@openai%2fcodex',args)
+        with patch.object(setup.shutil,'which',return_value='/usr/bin/curl'),\
+             patch.object(setup.subprocess,'run',return_value=CompletedProcess([],28,stdout='000')):
+            with self.assertRaisesRegex(setup.SetupError,'No direct-network fallback'):
+                setup.preflight_build_proxy(20820)
+
+    def test_podman_proxy_reachability_uses_pasta(self):
+        with patch.object(setup.subprocess,'run',return_value=CompletedProcess([],0)) as runner:
+            setup.preflight_podman_build_proxy(20820)
+        args=runner.call_args.args[0]
+        self.assertIn('--network=pasta:-T,20820',args)
+        self.assertNotIn('--network=host',args)
+        with patch.object(setup.subprocess,'run',return_value=CompletedProcess([],1,stderr='connection refused')):
+            with self.assertRaisesRegex(setup.SetupError,'npm build has not started'):
+                setup.preflight_podman_build_proxy(20820)
+
     def test_start_requires_approval_and_fail_closed_validation(self):
         cmds=[]
-        with patch.object(setup,'preflight_podman',return_value='5.0'),patch.object(setup,'run',side_effect=lambda c,**kw:cmds.append(c)),patch.object(setup,'confirm',return_value=False):
+        with patch.object(setup,'preflight_podman',return_value='5.0'),\
+             patch.object(setup,'preflight_build_proxy'),\
+             patch.object(setup,'preflight_podman_build_proxy'),\
+             patch.object(setup,'run',side_effect=lambda c,**kw:cmds.append(c)),patch.object(setup,'confirm',return_value=False):
             self.assertEqual(self.call('--start'),1)
         self.assertEqual(len(cmds),1)
-        with patch.object(setup,'preflight_podman',return_value='5.0'),patch.object(setup,'run',side_effect=lambda c,**kw:cmds.append(c)),patch.object(setup,'confirm',return_value=True),patch.object(setup,'container_exists',return_value=False),patch.object(setup,'test_container'):
+        with patch.object(setup,'preflight_podman',return_value='5.0'),\
+             patch.object(setup,'preflight_build_proxy'),\
+             patch.object(setup,'preflight_podman_build_proxy'),\
+             patch.object(setup,'run',side_effect=lambda c,**kw:cmds.append(c)),patch.object(setup,'confirm',return_value=True),patch.object(setup,'container_exists',return_value=False),patch.object(setup,'test_container'):
             self.assertEqual(self.call('--start'),0)
         self.assertTrue(any(c[:2]==['podman','run'] for c in cmds))
 
     def test_start_refuses_preexisting_container(self):
         cmds=[]
-        with patch.object(setup,'preflight_podman',return_value='5.0'),patch.object(setup,'run',side_effect=lambda c,**kw:cmds.append(c)),patch.object(setup,'confirm',return_value=True),patch.object(setup,'container_exists',return_value=True):
+        with patch.object(setup,'preflight_podman',return_value='5.0'),\
+             patch.object(setup,'preflight_build_proxy'),\
+             patch.object(setup,'preflight_podman_build_proxy'),\
+             patch.object(setup,'run',side_effect=lambda c,**kw:cmds.append(c)),patch.object(setup,'confirm',return_value=True),patch.object(setup,'container_exists',return_value=True):
             self.assertEqual(self.call('--start'),1)
         self.assertFalse(any(c[:2]==['podman','run'] for c in cmds))
 

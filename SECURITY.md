@@ -13,3 +13,9 @@ Do not publish `docker/xray`, `workspace-settings.json`, `~/.config/khroxy/*`, `
 Do not publish proxy port 20819 beyond 127.0.0.1. The HTTP proxy has no authentication.
 
 Mandatory live acceptance tests before security approval: rootless identity; separate namespace and no host-network access; IPv4/IPv6 default-deny; no direct TCP/UDP/DNS from agent when Xray is unavailable; no loopback-to-host bypass; working proxied HTTPS/WebSocket as agent; no host SSH/firewall changes; persistent data and permission checks; startup/reboot/shutdown with failure injection; image dependency verification.
+
+## Build-time networking (v0.9.1)
+
+The image builder temporarily forwards only an explicitly named native khroxy HTTP listener (default 127.0.0.1:20820) into rootless Podman's separate network namespace using `pasta:-T,PORT`. It sets standard HTTP(S) proxy environment variables only for `podman build`. It does NOT use host network mode or change the runtime egress guard.
+
+Base image downloads still occur through the Podman host registry client, and build-time networking is not proven fail-closed against tools which ignore proxy environment variables. Imported npm/Caveman dependencies execute during build and are not a hostile-code sandbox. Only build images from sources you trust.

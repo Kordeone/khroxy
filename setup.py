@@ -20,9 +20,10 @@ import time
 ROOT = Path(__file__).resolve().parent
 SETTINGS = ROOT / 'workspace-settings.json'
 STAGED_XRAY = ROOT / 'docker' / 'xray'
-IMAGE = 'localhost/khroxy-ai:0.9'
+IMAGE = 'localhost/khroxy-ai:0.9.1'
 CONTAINER = 'khroxy-ai'
 PROXY_PORT = 20819
+DEFAULT_BUILD_PROXY_PORT = 20820  # existing native khroxy application proxy
 
 class SetupError(ValueError):
     pass
@@ -74,8 +75,82 @@ def check_elf_xray(path):
     if expected is None or machine != expected:
         raise SetupError('Xray architecture does not match this supported host')
 
-def build_command(uid):
-    return ['podman','build','--file','docker/Containerfile',
+def valid_port(raw):
+    try:
+        p = int(raw)
+    except (TypeError, ValueError) as e:
+        raise SetupError('Build proxy port must be an integer from 1 to 65535') from e
+    if not 1 <= p <= 65535:
+        raise SetupError('Build proxy port must be between 1 and 65535')
+    return p
+
+
+def build_proxy_url(port):
+    return f'http://127.0.0.1:{valid_port(port)}'
+
+
+def build_proxy_env(port):
+    """Only affect Podman's build process; NEVER apply these to `podman run`."""
+    env = os.environ.copy()
+    url = build_proxy_url(port)
+    for name in ('HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','http_proxy','https_proxy','all_proxy'):
+        env[name] = url
+    for name in ('NO_PROXY','no_proxy'):
+        env[name] = 'localhost,127.0.0.1,::1'
+    # Don't silently inherit registry-specific overrides from a retired proxy.
+    env['NODE_USE_ENV_PROXY'] = '1'
+    return env
+
+
+def preflight_build_proxy(port):
+    """Check npm registry explicitly through host khroxy; no direct fallback."""
+    if not shutil.which('curl'):
+        raise SetupError('curl is required for build-proxy preflight; install it on Debian')
+    cmd = ['curl','--noproxy','','--proxy',build_proxy_url(port),
+           '--connect-timeout','6','--max-time','18','--silent','--show-error',
+           '--output','/dev/null','--write-out','%{http_code}',
+           'https://registry.npmjs.org/@openai%2fcodex']
+    try:
+        r = subprocess.run(cmd,capture_output=True,text=True,timeout=22)
+    except (OSError,subprocess.TimeoutExpired) as e:
+        raise SetupError(f'Build proxy 127.0.0.1:{port} is not responding: {type(e).__name__}') from e
+    if r.returncode or r.stdout.strip() != '200':
+        raise SetupError(f'Build proxy 127.0.0.1:{port} cannot fetch Codex from npm '
+                         f'(HTTP {r.stdout.strip() or "none"}); run khroxy test codex and retry. '
+                         'No direct-network fallback will be attempted.')
+
+
+def preflight_podman_build_proxy(port):
+    """Verify Podman build-style pasta forwarding before expensive apt/npm steps."""
+    js = ("const net=require('node:net');"
+          "const s=net.connect({host:'127.0.0.1',port:Number(process.argv[1])});"
+          "s.setTimeout(9000);"
+          "s.on('connect',()=>{console.log('build proxy TCP reachable');s.end()});"
+          "s.on('error',e=>{console.error(e.code||e.message);process.exitCode=1});"
+          "s.on('timeout',()=>{console.error('timeout');process.exitCode=1;s.destroy()});")
+    cmd = ['podman','run','--rm',f'--network=pasta:-T,{port}',
+           '--read-only','--security-opt=no-new-privileges',
+           'docker.io/library/node:24-trixie-slim','node','-e',js,str(port)]
+    try:
+        result = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, timeout=45)
+    except (OSError,subprocess.TimeoutExpired) as e:
+        raise SetupError('Podman build-proxy network preflight failed: '+type(e).__name__) from e
+    if result.returncode:
+        raise SetupError('Podman pasta build networking cannot reach the local proxy '
+                         f'on 127.0.0.1:{port}. The npm build has not started. '
+                         'Check that pasta supports -T and the selected proxy port. '
+                         'Podman: '+result.stderr.strip()[-300:])
+
+
+def build_command(uid, proxy_port=DEFAULT_BUILD_PROXY_PORT):
+    """pasta -T exposes ONLY the selected host TCP proxy to build RUN steps.
+
+    Never use --network=host: that grants package installers access to all
+    host-local services, and is unnecessary for a single localhost proxy.
+    """
+    p = valid_port(proxy_port)
+    return ['podman','build',f'--network=pasta:-T,{p}', '--http-proxy=true',
+            '--file','docker/Containerfile',
             '--build-arg',f'AGENT_UID={uid}',
             '--build-arg','CODEX_VERSION=0.164.0',
             '--build-arg','CAVEMAN_REF=v4.0.1',
@@ -115,8 +190,8 @@ def preflight_podman():
     except (OSError,subprocess.TimeoutExpired,json.JSONDecodeError) as e:
         raise SetupError('Podman preflight failed: '+type(e).__name__) from e
 
-def run(cmd, *, check=True):
-    return subprocess.run(cmd,cwd=ROOT,check=check,text=True)
+def run(cmd, *, check=True, env=None):
+    return subprocess.run(cmd,cwd=ROOT,check=check,text=True,env=env)
 
 def confirm(prompt):
     try:
@@ -180,6 +255,8 @@ def main(argv=None):
     ap.add_argument('--projects',help='Existing host projects directory; prompted if omitted')
     ap.add_argument('--xray',help='Trusted local Xray executable')
     ap.add_argument('--dry-run',action='store_true',help='Check paths and display plan only')
+    ap.add_argument('--build-proxy-port',type=int,default=DEFAULT_BUILD_PROXY_PORT,metavar='PORT',
+                    help='Host khroxy HTTP proxy for Podman build (default: 20820)')
     ap.add_argument('--configure-only',action='store_true',help='Stage configuration but do not build or start')
     ap.add_argument('--build',action='store_true',help='Build image with rootless Podman')
     ap.add_argument('--start',action='store_true',help='Build and ask approval to start container')
@@ -188,6 +265,7 @@ def main(argv=None):
         ap.error('--configure-only conflicts with --build/--start')
     try:
         uid=agent_uid()
+        build_port=valid_port(args.build_proxy_port)
         previous={}
         if SETTINGS.is_file():
             previous=json.loads(SETTINGS.read_text())
@@ -208,13 +286,14 @@ def main(argv=None):
         print(f'AI user: UID {uid}; Codex auth in a separate persistent named volume')
         print(f'Host proxy: 127.0.0.1:{PROXY_PORT}; no public/LAN listener')
         print('Trusted LAN: blocked initially; build: Node 24, npm/npx, Codex, Ultracave')
+        print(f'Build downloads: via existing host khroxy at 127.0.0.1:{build_port} (no direct fallback)')
         print('Xray binary:', binary or 'MISSING; required for build')
         if args.dry_run:
             print('DRY RUN: no files, packages, firewall, or containers changed')
             return 0
         if STAGED_XRAY.is_symlink():
             raise SetupError('Refusing symlink for staged Xray destination')
-        atomic_text(SETTINGS,json.dumps({'projects':str(projects),'uid':uid,'engine':'podman'},indent=2)+'\n')
+        atomic_text(SETTINGS,json.dumps({'projects':str(projects),'uid':uid,'engine':'podman', 'build_proxy_port':build_port},indent=2)+'\n')
         if binary:
             stage_xray(binary)
             print('Local Xray staged (excluded from Git and build secrets)')
@@ -228,7 +307,10 @@ def main(argv=None):
             raise SetupError('Missing Xray binary; cannot build')
         version=preflight_podman()
         print('Rootless Podman:',version)
-        run(build_command(uid))
+        preflight_build_proxy(build_port)
+        preflight_podman_build_proxy(build_port)
+        print('npm registry and Podman build proxy reachable; building with isolated pasta TCP forwarding')
+        run(build_command(uid, build_port), env=build_proxy_env(build_port))
         wants_start=args.start
         if not wants_start and sys.stdin.isatty():
             wants_start=confirm('Start workspace container? Type YES: ')
