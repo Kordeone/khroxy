@@ -1,12 +1,15 @@
-# khroxy security boundary (development preview)
+# Security status — v0.9
 
-Do not treat the Docker gateway as production-validated. Python unit tests and static checks are **not** proof of network isolation.
+**Development preview; not yet approved for running untrusted AI agent workloads.**
 
-- Do not publish `~/.config/khroxy/state.json`, `runtime.json`, subscription URLs, tokens, or a copied `docker/xray` binary.
-- Only expose the proxy to explicitly authorized containers and the Debian host loopback; the HTTP endpoint does **not** authenticate clients.
-- Docker may modify **host** firewall rules. This project must not be deployed on khomelab until the owner approves a safe Docker/firewall change and SSH continuity testing.
-- The AI process network policy is designed to **block direct egress**; it is not a transparent VPN. Proxy-unaware programs fail rather than bypass it.
-- Public proxy access and DNS over IPv6 must be checked under real Docker namespaces. A dead Xray process must not cause direct fallback.
-- `@fastest` is based on recent HTTPS measurements to a single test endpoint; it does not guarantee fastest ChatGPT/other AI endpoints. The host CLI currently requires manually initiated retesting, while the Docker preview includes scheduled probes.
-- The Python runtime and Docker startup scripts are reviewed offline only; deployed firewall/killswitch tests remain a release gate.
-- Report security issues privately; avoid including subscription URLs, UUIDs, proxy server credentials, account IDs, or app-specific secrets in issues.
+Rootless Podman reduces dependence on a root-managed container daemon but does **not** by itself guarantee an egress kill switch. `pasta` networking, IPv4/IPv6 iptables owner matching, DNS behavior, port publication, and namespace-local privileged setup must be verified on the actual Debian host.
+
+The installer avoids host firewall, SSH, NetworkManager, Docker, and systemd modifications, and refuses rootful Podman. Before modifying any firewall policy the guard checks that it is inside Podman and in a different network namespace from the host. Startup refuses missing capabilities/netfilter and stops on any failed direct socket test. These safeguards are **defense in depth**, not a proof of confinement.
+
+Container AI tools have read/write access to the chosen project folder, so this mount is an **intentional security exposure**. Do not mount `/`, your entire home, secrets, SSH keys, or Podman sockets. The Codex login volume is credential-sensitive.
+
+Do not publish `docker/xray`, `workspace-settings.json`, `~/.config/khroxy/*`, `~/.codex/*`, or the Podman named volumes. The git ignore/build-context ignore are designed to exclude these but manually verify `git status --short` before publishing.
+
+Do not publish proxy port 20819 beyond 127.0.0.1. The HTTP proxy has no authentication.
+
+Mandatory live acceptance tests before security approval: rootless identity; separate namespace and no host-network access; IPv4/IPv6 default-deny; no direct TCP/UDP/DNS from agent when Xray is unavailable; no loopback-to-host bypass; working proxied HTTPS/WebSocket as agent; no host SSH/firewall changes; persistent data and permission checks; startup/reboot/shutdown with failure injection; image dependency verification.

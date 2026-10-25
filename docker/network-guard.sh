@@ -4,9 +4,23 @@
 set -eu
 [ "$(id -u)" = 0 ] || { echo 'Network guard must run as container root' >&2; exit 1; }
 [ "${KHROXY_CONTAINER:-}" = 1 ] || { echo 'Refusing to operate outside khroxy container mode' >&2; exit 1; }
-# Refuse host-network containers and direct host execution (must be Docker veth).
-[ -f /.dockerenv ] && ip -o link show eth0 2>/dev/null | grep -q 'eth0@if' || {
-  echo 'Refusing network guard: not a Docker private bridge namespace' >&2; exit 1;
+# Refuse accidental host execution and a host-network Podman container.
+# Setup supplies the host namespace inode from before podman run. The guard
+# must compare it BEFORE changing any network policy.
+[ -f /run/.containerenv ] || [ -f /.containerenv ] || {
+  echo 'Refusing network guard: not inside a Podman container' >&2; exit 1;
+}
+case "${KHROXY_HOST_NETNS:-}" in
+  net:\[*\]) ;;
+  *) echo 'Refusing missing or invalid host network namespace fingerprint' >&2; exit 1 ;;
+esac
+current_ns="$(readlink /proc/self/ns/net)"
+[ "$current_ns" != "$KHROXY_HOST_NETNS" ] || {
+  echo 'Refusing network guard: container shares HOST network namespace' >&2; exit 1;
+}
+# Check a non-loopback interface exists in the private container namespace.
+ip -o link show | grep -qvE '^[0-9]+: lo:' || {
+  echo 'Refusing network guard: no isolated network device present' >&2; exit 1;
 }
 # Requires iptables (nft backend), including owner-match and conntrack modules.
 command -v iptables >/dev/null
@@ -25,7 +39,7 @@ ip6tables -w -A OUTPUT -m owner --uid-owner "$PUID" -j ACCEPT
 # Replies to accepted incoming container proxy traffic are allowed.
 iptables -w -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 ip6tables -w -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-# Prevent agent resolving through Docker's embedded DNS bypassing the tunnel.
+# Prevent bypass via special internal DNS listeners (if configured).
 iptables -w -A OUTPUT -m owner --uid-owner "$AUID" -d 127.0.0.11 -j REJECT
 # Permit loopback access to the khroxy proxy on localhost only.
 iptables -w -A OUTPUT -o lo -d 127.0.0.1/32 -j ACCEPT

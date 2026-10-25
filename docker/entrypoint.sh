@@ -3,7 +3,7 @@ set -eu
 # Startup stops on any firewall failure. Nothing user-executed is started first.
 /usr/local/bin/network-guard.sh
 mkdir -p /home/khroxy/.config/khroxy
-chown -R khroxy:khroxy /home/khroxy/.config/khroxy
+chown khroxy:khroxy /home/khroxy/.config/khroxy
 chown agent:agent /home/agent
 # Never chown or otherwise modify /workspace bind-mount contents.
 gosu khroxy env HOME=/home/khroxy KHROXY_CONTAINER=1 /home/khroxy/.local/bin/khroxy init
@@ -15,5 +15,5 @@ if ! gosu khroxy env HOME=/home/khroxy KHROXY_CONTAINER=1 \
 fi
 gosu khroxy env HOME=/home/khroxy KHROXY_CONTAINER=1 \
     /usr/local/bin/scheduler.sh &
-# Root is only the idle bootstrap/supervisor. AI commands use `docker compose exec -u agent`.
+# Root is only the idle bootstrap/supervisor. AI commands use `workspace.sh codex/shell`.
 exec sleep infinity

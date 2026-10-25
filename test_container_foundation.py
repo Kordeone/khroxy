@@ -41,31 +41,22 @@ class ContainerFoundation(unittest.TestCase):
         self.assertEqual({i['tag']:i['listen'] for i in conf['inbounds']},
                          {'app-kilo':'127.0.0.1','gateway':'0.0.0.0'})
 
-    def test_compose_has_localhost_only_publish_and_no_host_network(self):
-        if yaml is None:
-            text=(p/'compose.yaml').read_text()
-            for snippet in ('127.0.0.1:20819:20819/tcp', 'cap_drop: [ALL]',
-                            'read_only: true','create_host_path: false', '/mnt/storage/Projects'):
-                self.assertIn(snippet, text)
-            self.assertNotIn('network_mode: host', text.split('services:')[1].split('networks:')[0])
-            return
-        compose=yaml.safe_load((p/'compose.yaml').read_text())
-        service=compose['services']['khroxy']
-        self.assertEqual(service['ports'],['127.0.0.1:20819:20819/tcp'])
-        self.assertNotIn('privileged',service)
-        self.assertEqual(service['cap_drop'],['ALL'])
-        self.assertNotIn('network_mode',service)
-        self.assertEqual(service['volumes'][0]['source'],'/mnt/storage/Projects')
-        self.assertFalse(service['volumes'][0]['bind']['create_host_path'])
-        self.assertTrue(service['read_only'])
-        self.assertTrue(service['security_opt'])
-        self.assertNotIn('/var/run/docker.sock',str(service))
+    def test_podman_runtime_has_localhost_port_and_private_network(self):
+        import setup
+        cmd=setup.start_command(Path('/mnt/storage/Projects'),'net:[1234]')
+        self.assertIn('127.0.0.1:20819:20819/tcp',cmd)
+        self.assertIn('--network=pasta',cmd)
+        self.assertNotIn('--network=host',cmd)
+        self.assertNotIn('docker',str(cmd).lower())
+        self.assertIn('--cap-drop=all',cmd)
+        self.assertNotIn('--privileged',cmd)
 
     def test_guard_sets_drop_before_exceptions_and_denies_docker_dns(self):
         text=(p/'docker/network-guard.sh').read_text()
         self.assertLess(text.index('iptables -w -P OUTPUT DROP'),text.index('iptables -w -A OUTPUT -m owner'))
         self.assertLess(text.index('ip6tables -w -P OUTPUT DROP'),text.index('ip6tables -w -A OUTPUT -m owner'))
-        self.assertIn('127.0.0.11 -j REJECT',text)
+        self.assertIn('KHROXY_HOST_NETNS',text)
+        self.assertLess(text.index('current_ns='),text.index('iptables -w -P OUTPUT DROP'))
         self.assertIn('--uid-owner "$PUID" -j ACCEPT',text)
         self.assertIn('--uid-owner "$AUID" -d "$addr" -p tcp --dport "$port"',text)
         self.assertNotIn('iptables -w -P OUTPUT ACCEPT',text)

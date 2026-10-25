@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""khroxy: local-only, per-application Xray profile manager (v0.7.1).
+"""khroxy: local-only, per-application Xray profile manager (v0.8).
 
 No system-wide routing, firewall, NetworkManager, or existing codex-xray edits.
 """

@@ -1,16 +1,14 @@
 # Changelog
 
-## 0.7.1 — Reliability audit / GitHub preparation
+## 0.9 — Rootless Podman conversion (October 2026)
 
-- Fix `g` being consumed by scroll-to-End navigation before it could activate Fastest mode in the Profiles TUI; Home/End remain supported.
-- Prevent stale `@active` / `@fastest` application references from aborting the `any` subscription-fetch mode before trying healthy profiles.
-- Add a regression test for this failure.
-- Add repository-level secret/build exclusions, offline GitHub Actions checks, and a security/deployment status document.
-- Keep the same four-screen keyboard-first TUI and `?` keybindings overlay.
-- Docker runtime remains **unverified**: no live kernel, container, or firewall tests have run.
+- Switched the workspace installer from Docker Compose to **Podman directly** (`podman build/run/exec`). No Docker or Compose required.
+- Kept the exact four-screen khroxy TUI and its keybindings.
+- Kept the setup-time prompt for the host projects folder, mounted read/write at `/workspace` using rootless Podman `--userns=keep-id`.
+- Preserved one combined container with Node 24, npm/npx, Codex, Caveman/Ultracave, Xray, and separate persistent Codex and khroxy volumes.
+- Restricted proxy publication to host `127.0.0.1:20819`; rootless `pasta` for runtime network, no host network mode.
+- Replaced Docker-specific `eth0@if` guard with Podman marker plus a host-vs-container network namespace check before firewall changes.
+- Added rootless preflight, no automatic Podman install, explicit start authorization, and container isolation smoke checks.
+- Offline verified; **live Podman networking and kill-switch checks remain outstanding.**
 
-## 0.7 — Initial four-screen TUI and Docker development preview
-
-- Profiles, Applications, Subscriptions and Logs on separate screens.
-- Active-profile marker, HTTPS latency probes and symbolic active/fastest routes.
-- Experimental combined Docker gateway + AI workspace with a namespace-local egress guard.
+See older v0.8 packages for prior release history.
