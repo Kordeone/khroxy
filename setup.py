@@ -32,9 +32,17 @@ def projects_path(raw):
     path = Path(raw).expanduser()
     if not path.is_absolute():
         raise SetupError('Projects path must be absolute, e.g. /mnt/storage/Projects')
-    if path.is_symlink() or not path.is_dir():
-        raise SetupError('Projects path must be an existing directory, not a symlink')
-    resolved = path.resolve(strict=True)
+    # Reject forbidden literal paths BEFORE filesystem probes: an unprivileged
+    # installer cannot even stat /root/.ssh on a locked-down CI/host.
+    for restricted in ('/proc', '/sys', '/dev', '/etc', '/run', '/root', '/boot', '/usr', '/var', '/opt'):
+        if path == Path(restricted) or Path(restricted) in path.parents:
+            raise SetupError('Refusing to mount a protected system directory')
+    try:
+        if path.is_symlink() or not path.is_dir():
+            raise SetupError('Projects path must be an existing directory, not a symlink')
+        resolved = path.resolve(strict=True)
+    except PermissionError as exc:
+        raise SetupError('Projects path is not accessible by this user') from exc
     if len(resolved.parts) < 4:
         raise SetupError('Refusing broad host mount; choose the projects folder itself')
     if ',' in str(resolved) or '\n' in str(resolved):
