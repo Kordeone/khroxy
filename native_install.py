@@ -99,6 +99,7 @@ def main(argv=None):
         print("Declined. No changes.")
         return 0
     print("Khroxy:", install_file((ROOT / "khroxy").read_bytes(), dest))
+    print("Windscribe adapter:", install_file((ROOT / "khroxy_vpn.py").read_bytes(), TARGET / "khroxy-vpn"))
     xray = TARGET / "xray"
     if args.install_xray:
         if xray.exists():
