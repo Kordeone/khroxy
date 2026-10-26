@@ -1,0 +1,21 @@
+name: Native Khroxy unit suite
+on:
+  push:
+    branches: [work/native-installer-separation]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+jobs:
+  unit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - run: python3 -m unittest discover -q
+      - run: python3 -m py_compile native_install.py khroxy
+      - run: sh -n install.sh
