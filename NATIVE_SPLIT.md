@@ -30,3 +30,5 @@ verified release** of this native component, never the other way around.
 
 Do not treat the legacy container HTTP proxy as a verified whole-container
 tunnel. All live Debian deployment requires separate approval.
+
+The independent native installer also places `khroxy-vpn` (read-only Windscribe status and version-pinned package metadata) in `~/.local/bin`. Actual service installation and protected backend switching remain owned by the isolated Khagent container, not by host Khroxy.
