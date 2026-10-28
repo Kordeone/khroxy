@@ -1,15 +1,7 @@
-# Publish v0.9.1 to GitHub
+# Publish the independent standalone release
 
-Run `python3 -m unittest discover -q` locally. The package is source-only; secrets, Xray binary, Codex credentials, subscription URLs and project files are not included.
+Publish only after every mandatory gate in `docs/TASKS.md` and `RELEASE_AUDIT.md` passes. Build and verify artifacts from the exact clean committed development revision as described in `docs/RELEASE.md`; retain the successful test log and artifact checksums.
 
-From the extracted directory:
+Do not initialize a new repository, rewrite history, merge into main, deploy a container, or include workspace settings/credentials. Publish a tag/release that points to the tested commit, with unchanged verified source/zipapp/checksum assets and accurate limitations. The GitHub release must not claim live-verified optional container isolation, public-network verification, or unsupported XRAT parity.
 
-```sh
-git init -b main
-git add .
-git status --short
-git commit -m "khroxy v0.9.1: rootless Podman workspace preview"
-gh repo create khroxy --private --source=. --remote=origin --push
-```
-
-Use a **private repository** while the container kill switch is unverified. Connect the GitHub integration or authenticate `gh` on Debian before trying to publish. Do not put credentials in commit history. `.containerignore` prevents unnecessary build inputs; `.gitignore` excludes local runtime secrets.
+Validation jobs have read-only permissions. A separate tag-only publishing job has narrowly scoped repository-content write permission and depends on successful real-engine regression/artifact verification. Push the development branch first and require green validation before deliberately creating/pushing `v0.2.0`; the tag job stages a draft and publishes only after asset digest checks pass. If authenticated release publication is unavailable, report the precise blocker and keep the tested local artifacts; never fabricate a release URL or declare an unpublished build released.

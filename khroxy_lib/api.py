@@ -1,6 +1,9 @@
 # KHROXY managed module
 """Opt-in authenticated loopback management; no raw configurations or exports."""
 import argparse
+import fcntl
+import signal
+import time
 import hmac
 import http.client
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -13,7 +16,7 @@ from socketserver import ThreadingMixIn
 import stat
 import threading
 from urllib.parse import parse_qs, urlsplit
-from . import automation
+from . import automation, supervisor
 from .storage import exclusive_file
 
 
@@ -95,7 +98,7 @@ class Handler(BaseHTTPRequestHandler):
                     query.get('protocol'),None if 'enabled' not in query else query['enabled']=='true',query.get('search',''))
             else:self.send(404,{'error':'not-found'});return
             self.send(200,result)
-        except (OSError,ValueError,KeyError,TypeError,TimeoutError):self.send(400,{'error':'invalid-or-unavailable-operation'})
+        except (OSError,ValueError,KeyError,TypeError,TimeoutError,RecursionError):self.send(400,{'error':'invalid-or-unavailable-operation'})
     def do_GET(self):self.handle_api()
     def do_POST(self):self.handle_api(True)
 
@@ -129,7 +132,25 @@ def cli(app,argv):
         exclusive_file(args.output,(secrets.token_urlsafe(32)+'\n').encode());print(json.dumps({'private_token_written':True}));return
     if args.listen not in ('127.0.0.1','::1') or not 1024<=args.port<=65535:raise ValueError('API requires explicit loopback and unprivileged port')
     token=token_file(args.token_file)
-    with Server((args.listen,args.port),app,token) as server:
-        print(json.dumps({'api':'ready','listen':args.listen,'port':args.port,'authentication':True}),flush=True)
-        try:server.serve_forever(poll_interval=.1)
-        except KeyboardInterrupt:pass
+    lock=os.open(app.ROOT/'.api-lock',os.O_RDWR|os.O_CREAT|getattr(os,'O_NOFOLLOW',0),0o600)
+    try:
+        try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError:raise ValueError('Owned management API is already running') from None
+        supervisor.write(app.ROOT,'api-owner.json',supervisor.identity(os.getpid()))
+        with Server((args.listen,args.port),app,token) as server:
+            print(json.dumps({'api':'ready','listen':args.listen,'port':args.port,'authentication':True}),flush=True)
+            try:server.serve_forever(poll_interval=.1)
+            except KeyboardInterrupt:pass
+    finally:
+        record=supervisor.read(app.ROOT,'api-owner.json')
+        if record.get('pid')==os.getpid(): (app.ROOT/'api-owner.json').unlink(missing_ok=True)
+        os.close(lock)
+
+
+def stop(root):
+    record=supervisor.read(root,'api-owner.json')
+    if supervisor.owned(record,False):
+        supervisor.safe_signal(record,signal.SIGTERM,token_required=False)
+        deadline=time.monotonic()+3
+        while supervisor.owned(record,False) and time.monotonic()<deadline:time.sleep(.02)
+        if supervisor.owned(record,False):raise ValueError('Owned API did not stop; uninstall refused')

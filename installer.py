@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Unified installer. Dry runs never write files or invoke a container/service."""
 import argparse
+import copy
+import tempfile
 import importlib.machinery
 import importlib.util
 import json
@@ -11,7 +13,7 @@ import sys
 
 import setup
 from khroxy_lib.storage import Store
-from khroxy_lib import engines
+from khroxy_lib import engines, upgrading
 
 ROOT = Path(__file__).resolve().parent
 
@@ -102,7 +104,12 @@ def native_install(args):
         if target.exists() and not target.read_text().startswith('# KHROXY managed module'):
             raise setup.SetupError('Foreign module retained; refusing overwrite')
     # Installation does not restart a running gateway, including during upgrades.
+    if cli.exists(): upgrading.stopped(home)
+    previous_code = upgrading.snapshot(home)
+    if previous_code: print('Private rollback code snapshot:', previous_code)
     fd = None
+    rollback_files = {}
+    state_before = None
     try:
         state.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         state.parent.chmod(0o700)
@@ -118,7 +125,15 @@ def native_install(args):
             current['engine'] = engine
             current.setdefault('engine_binaries',{})[engine] = str(xray)
             saved = current
+        state_before = copy.deepcopy(Store(state).load() if Store(state).exists else json.loads(state.read_text()) if state.exists() else saved)
         engines.prepare_management(saved)
+        config = mod.build_runtime(saved)
+        if config['inbounds']:
+            with tempfile.TemporaryDirectory(prefix='khroxy-install-check-') as check_root:
+                engines.validate(binary, engine, config, check_root)
+        for path in (cli, xray, runtime, unit, health_unit, *(home / '.local/lib/khroxy/khroxy_lib' / source.name for source in modules)):
+            safe_path(path, home)
+            rollback_files[path] = (path.read_bytes(), path.stat().st_mode & 0o777) if path.exists() else None
         for path in (cli, xray, unit):
             path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         if cli.exists() and cli.read_bytes() != (ROOT / 'khroxy').read_bytes():
@@ -131,12 +146,30 @@ def native_install(args):
         if not xray.exists():
             setup.atomic_text(xray, binary.read_bytes(), 0o700)
         if Store(state).exists:
+            if saved != Store(state).load():
+                Store(state).export(state.parent / ('before-upgrade-' + str(__import__('time').time_ns()) + '.json'))
             Store(state).save(saved)
         else:
-            setup.atomic_text(state, json.dumps(saved, indent=2) + '\n')
+            if not state.exists(): setup.atomic_text(state, json.dumps(saved, indent=2) + '\n')
             Store(state).migrate()
+            Store(state).save(saved)
+        if config['inbounds']:
+            setup.atomic_text(runtime, mod.serial(config), 0o600)
+        else:
+            runtime.unlink(missing_ok=True)
         setup.atomic_text(unit, proxy_unit, 0o644)
         setup.atomic_text(health_unit, health_contents, 0o644)
+    except BaseException:
+        recovered = True
+        for path, previous in rollback_files.items():
+            try:
+                if previous is None: path.unlink(missing_ok=True)
+                else: setup.atomic_text(path, previous[0], previous[1])
+            except OSError: recovered = False
+        if state_before is not None and Store(state).exists:
+            try: Store(state).save(state_before)
+            except (OSError, ValueError): recovered = False
+        raise setup.SetupError('Installation failed; code/state recovery ' + ('completed' if recovered else 'requires review') + '; private snapshots retained') from None
     finally:
         if fd is not None:
             os.close(fd)
@@ -159,12 +192,24 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--mode', choices=('native', 'container'))
     parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument('--rollback-code', metavar='SNAPSHOT_ID', help='Restore a verified private code snapshot; database remains unchanged')
     parser.add_argument('--xray')
     parser.add_argument('--proxy-engine', choices=engines.NAMES)
     parser.add_argument('--engine-binary')
     parser.add_argument('--health-interval', type=int)
     parser.add_argument('--enable-services', action='store_true', help='Ask explicitly before enabling user services')
     args, extra = parser.parse_known_args(argv)
+    if args.rollback_code:
+        if extra or args.dry_run or args.enable_services or args.engine_binary or args.xray:
+            parser.error('Code rollback cannot be combined with installation options')
+        try:
+            setup.agent_uid()
+            retained = upgrading.restore(Path.home(), args.rollback_code, setup.atomic_text)
+            print('Code restored; database retained. Previous code snapshot:', retained)
+            return 0
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            print('installer:', error, file=sys.stderr)
+            return 1
     if args.mode is None:
         if not sys.stdin.isatty():
             parser.error('Use --mode native or --mode container in noninteractive mode')

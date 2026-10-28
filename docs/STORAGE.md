@@ -27,4 +27,4 @@ Rollback to the previous JSON implementation requires stopping all KHROXY writer
 
 ## PostgreSQL evaluation
 
-PostgreSQL would require a separately managed server, authentication, an extra driver and cross-backend transaction conformance. None is needed for the local CLI/TUI or concurrent local workload. This task introduces explicit storage boundaries for a future adapter but does not add a runtime server dependency or claim PostgreSQL support. SQLite remains the v0.2.0.dev10 local-first backend; optional PostgreSQL parity is evaluated as unsuitable for the mandatory local runtime, not silently emulated.
+PostgreSQL would require a separately managed server, authentication, an extra driver and cross-backend transaction conformance. None is needed for the local CLI/TUI or concurrent local workload. This task introduces explicit storage boundaries for a future adapter but does not add a runtime server dependency or claim PostgreSQL support. SQLite remains the v0.2.0 local-first backend; optional PostgreSQL parity is evaluated as unsuitable for the mandatory local runtime, not silently emulated.

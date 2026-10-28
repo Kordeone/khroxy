@@ -145,6 +145,9 @@ class AutomationIntegrationTests(unittest.TestCase):
         connection=http.client.HTTPConnection('127.0.0.1',self.port,timeout=5)
         connection.request('GET','/v1/status',headers={'X-Oversized':'x'*20000})
         response=connection.getresponse();self.assertEqual(response.status,431);response.read();connection.close()
+        connection=http.client.HTTPConnection('127.0.0.1',self.port,timeout=5)
+        connection.request('POST','/v1/selection','['*1100+']'*1100,{'Authorization':'Bearer '+self.token,'Content-Type':'application/json'})
+        response=connection.getresponse();self.assertEqual(response.status,400);response.read();connection.close()
         with (self.root/'.lock').open('w') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX);start=time.monotonic()
             self.assertEqual(self.request('/v1/selection','POST',{'name':'two'})[0],400)

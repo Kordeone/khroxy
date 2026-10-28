@@ -97,7 +97,8 @@ def safe_signal(record,kind,token_required=True):
     if not owned(record,token_required):return False
     if not hasattr(os,'pidfd_open') or not hasattr(signal,'pidfd_send_signal'):
         raise ValueError('Safe pidfd signalling unavailable; manual review required')
-    fd=os.pidfd_open(record['pid'])
+    try:fd=os.pidfd_open(record['pid'])
+    except ProcessLookupError:return False
     try:
         if not owned(record,token_required):return False
         try:signal.pidfd_send_signal(fd,kind)
@@ -128,7 +129,7 @@ def rpc(root,op,timeout=5,**values):
 
 
 class Runtime:
-    def __init__(self,app):self.app=app;self.root=app.ROOT;self.lock=threading.RLock();self.child=None
+    def __init__(self,app):self.app=app;self.root=app.ROOT;self.lock=threading.RLock();self.child=None;self.closing=False
     def event(self,code,record=None):
         self.app.log_event(code,detail='unavailable' if 'fail' in code else 'ready')
         if Store(self.app.STATE).exists:
@@ -151,6 +152,8 @@ class Runtime:
     def start(self,recovery=False):
         with self.lock:
             record=self.recover_intent()
+            if self.closing:raise ValueError('Supervisor is shutting down')
+            if recovery and not record.get('desired'):return self.status()
             if owned(record):return self.status()
             now=time.time();attempts=[stamp for stamp in record.get('attempts',[]) if 0<=now-stamp<60]
             if recovery and (record.get('blocked') or len(attempts)>=3):
@@ -244,7 +247,10 @@ class Handler(socketserver.StreamRequestHandler):
             elif op=='restart':runtime.stop();result=runtime.start()
             elif op=='shutdown':
                 self.server.keep_runtime=value.get('keep_runtime') is True
-                result=runtime.status();threading.Thread(target=self.server.shutdown,daemon=True).start()
+                with runtime.lock:
+                    runtime.closing=True
+                    result=runtime.status() if self.server.keep_runtime else runtime.stop()
+                threading.Thread(target=self.server.shutdown,daemon=True).start()
             else:raise ValueError('unsupported-operation')
             response={'ok':True,'result':result}
         except (OSError,ValueError,TypeError,subprocess.SubprocessError):response={'ok':False,'error':'invalid-or-unavailable-operation'}
@@ -278,10 +284,13 @@ def run(app):
                             runtime.start(recovery=True)
                     except (OSError,ValueError,subprocess.SubprocessError):pass
             worker=threading.Thread(target=maintenance,daemon=True);worker.start()
-            def shutdown(*args):threading.Thread(target=server.shutdown,daemon=True).start()
+            def shutdown(*args):
+                runtime.closing=True
+                threading.Thread(target=server.shutdown,daemon=True).start()
             signal.signal(signal.SIGTERM,shutdown);signal.signal(signal.SIGINT,shutdown)
             try:server.serve_forever(poll_interval=.1)
             finally:
+                runtime.closing=True
                 stop.set();worker.join(timeout=.5)
                 if not server.keep_runtime:runtime.stop()
                 path.unlink(missing_ok=True)
@@ -334,13 +343,17 @@ def cli(app,argv):
         raise ValueError('Supervisor readiness timed out')
     if args.action in ('stop','disable'):
         keep=args.action=='stop' and args.keep_runtime
-        try:result=rpc(app.ROOT,'shutdown',keep_runtime=keep)
+        owner=read(app.ROOT,OWNER);previous=read(app.ROOT,SESSION)
+        try:rpc(app.ROOT,'shutdown',timeout=35,keep_runtime=keep)
         except (FileNotFoundError,ConnectionRefusedError):
-            result=Runtime(app).status() if keep else Runtime(app).stop()
-        if args.action=='disable':
-            deadline=time.monotonic()+5
-            while (app.ROOT/SOCKET).exists() and time.monotonic()<deadline:time.sleep(.02)
-            if (app.ROOT/SOCKET).exists():raise ValueError('Supervisor still active; mode retained')
-            (app.ROOT/MODE).unlink(missing_ok=True)
+            if not keep:Runtime(app).stop()
+        deadline=time.monotonic()+40
+        while ((app.ROOT/SOCKET).exists() or owned(owner,False) or
+               (not keep and (owned(previous) or owned(read(app.ROOT,SESSION))))) and time.monotonic()<deadline:
+            time.sleep(.02)
+        if (app.ROOT/SOCKET).exists() or owned(owner,False) or (not keep and (owned(previous) or owned(read(app.ROOT,SESSION)))):
+            raise ValueError('Supervisor shutdown incomplete; records/mode retained for review')
+        if args.action=='disable':(app.ROOT/MODE).unlink(missing_ok=True)
+        result=Runtime(app).status();result['daemon']=False
         print(json.dumps(result));return
     print(json.dumps(rpc(app.ROOT,'start' if args.action=='proxy-start' else 'stop',timeout=35)))

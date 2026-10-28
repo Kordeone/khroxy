@@ -1,0 +1,8 @@
+{
+  "architecture": "linux-amd64",
+  "engines": {
+    "xray": {"version": "26.9.9", "url": "https://github.com/XTLS/Xray-core/releases/download/v26.9.9/Xray-linux-64.zip", "sha256": "1eb9175d0f0a8f8149c9230a7fc5ae66ce332ed20a53155ce61fe62e3f58b7df", "member": "xray", "archive": "zip", "license": "MPL-2.0"},
+    "v2ray": {"version": "5.53.0", "url": "https://github.com/v2fly/v2ray-core/releases/download/v5.53.0/v2ray-linux-64.zip", "sha256": "6bbb8aee65a57d0b12599b4b7c842b3ad0daca4436e661d94015c447cb31b4fa", "member": "v2ray", "archive": "zip", "license": "MIT"},
+    "sing-box": {"version": "1.14.4", "url": "https://github.com/SagerNet/sing-box/releases/download/v1.14.4/sing-box-1.14.4-linux-amd64.tar.gz", "sha256": "699a1b510aa4396b2176d32d1181920399ebf1e267835da6f3b598d0f7c24968", "member": "sing-box-1.14.4-linux-amd64/sing-box", "archive": "tar.gz", "license": "GPL-3.0-or-later; upstream naming restrictions"}
+  }
+}

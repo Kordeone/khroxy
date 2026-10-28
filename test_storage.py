@@ -27,12 +27,24 @@ class StorageTests(unittest.TestCase):
         self.raw = json.dumps(self.state).encode(); self.path.write_bytes(self.raw)
         self.store = Store(self.path)
 
+    def test_unsafe_linked_source_and_fifo_backup_refused_without_data_loss(self):
+        linked = self.root / 'linked-source'
+        os.link(self.path, linked)
+        with self.assertRaisesRegex(ValueError, 'Unsafe'): self.store.migrate()
+        self.assertEqual(self.path.read_bytes(), self.raw)
+        linked.unlink()
+        backup = self.path.with_name('state.json.pre-sqlite')
+        os.mkfifo(backup)
+        with self.assertRaisesRegex(ValueError, 'unsafe'): self.store.migrate()
+        self.assertEqual(self.path.read_bytes(), self.raw)
+        self.assertFalse(self.store.path.exists())
+
     def test_migration_preserves_all_fields_and_original_bytes(self):
         self.assertTrue(self.store.migrate())
         self.assertEqual(self.store.load(), self.state)
         self.assertEqual(self.path.read_bytes(), self.raw)
         self.assertEqual(self.path.with_name('state.json.pre-sqlite').read_bytes(), self.raw)
-        for path in (self.store.path,self.path.with_name('state.json.pre-sqlite')):
+        for path in (self.path,self.store.path,self.path.with_name('state.json.pre-sqlite')):
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
         self.assertEqual(self.root.stat().st_mode & 0o777, 0o700)
 

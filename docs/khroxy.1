@@ -1,0 +1,70 @@
+.TH KHROXY 1 "2026" "KHROXY" "User Commands"
+.SH NAME
+khroxy \- independent rootless per-application proxy manager
+.SH SYNOPSIS
+.B khroxy
+.RI [ command ]
+.SH DESCRIPTION
+Without a command, opens the original four-screen keyboard-first TUI.
+Profiles, Applications, Subscriptions, Logs; press ? for dedicated key help.
+No host routing, firewall, SSH or desktop settings are modified.
+.SH INSTALLATION
+Run ./install.sh for the interactive native or optional AI-container installer.
+Existing configuration is preserved. Engines are optional external dependencies.
+.SH COMMANDS
+.TP
+.B profiles, apps, subs, logs
+Existing human-readable inventory and diagnostics.
+.TP
+.B import NAME, import-data, sub-add, sub-update
+Import share links, subscriptions or supported bounded files/stdin.
+.TP
+.B app-add, switch, select, fastest, run, service-env, shell-init
+Configure per-application proxies; preserve fixed, @active and @fastest mappings.
+.TP
+.B health, health-config, health-watch, rotation
+Periodic testing, hysteresis, cooldown, pinning and session-safe selection.
+.TP
+.B storage, profile
+Transactional migration, private backups, restore, lifecycle and history.
+.TP
+.B engine, test-profiles, results, metadata
+Optional engine discovery/selection, bounded tests and persistent diagnostics.
+.TP
+.B daemon
+Private owned-process supervisor and explicit user-service preparation.
+.TP
+.B listener, route, dns, scan
+Loopback services, explicit rules, engine-local DNS and bounded candidate scans.
+.TP
+.B automation status|profiles|select|rotate
+Stable schema-1 JSON. Select/rotate do not trigger network testing.
+Fastest requires fresh successful health; active changes require stopped runtime.
+.TP
+.B export-data
+Validated private JSON/base64/SIP008 subscriptions or full backups.
+Credentials require --include-secrets and an exclusive private --output file.
+.TP
+.B api token|serve
+Optional authenticated loopback-only management API. No automatic startup.
+.TP
+.B completion bash|zsh|fish, manual
+Print shell completion source or this manual in roff format.
+.TP
+.B uninstall
+Stop only owned services/processes; preserve saved data by default.
+Use --dry-run before an explicit --purge.
+.SH FILES
+~/.config/khroxy/state.sqlite is authoritative after migration.
+The original state.json is a frozen rollback source, not a second writer.
+Files containing authentication use mode 0600; configuration directory uses 0700.
+.SH SECURITY
+No automatic direct fallback. Direct routing requires an explicit rule.
+Local proxy listeners are accessible to local processes; optional authentication
+is available. This is not a host-wide VPN, TUN or application sandbox.
+Never publish private backups, token files or engine configuration.
+.SH EXIT STATUS
+0 success; 1 rejected operation/failure; 2 invalid arguments; 130 cancellation.
+Some legacy commands retain their existing output and exit behavior.
+.SH SEE ALSO
+Use khroxy COMMAND --help and the repository docs directory.

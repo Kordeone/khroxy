@@ -154,7 +154,7 @@ def adapt(config, name, management=None):
                 'streamSettings':{'network':'domainsocket','dsSettings':{'path':path}}})
             config['routing']['rules'].insert(0,{'type':'field','inboundTag':[tag],'outboundTag':tag})
         return config
-    out={'log':{'level':'warn'},'inbounds':[],'outbounds':[],'route':{'rules':[]}}
+    out={'log':{'disabled':True},'inbounds':[],'outbounds':[],'route':{'rules':[]}}
     if 'api' in config:
         if not management or not 1024<=management.get('port',0)<=65535 or len(management.get('secret',''))<32:
             raise ValueError('Initialize private engine management before live Fastest')

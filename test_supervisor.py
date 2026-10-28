@@ -51,6 +51,19 @@ class OwnershipTests(unittest.TestCase):
             (root/supervisor.SESSION).chmod(0o644)
             with self.assertRaises(ValueError):supervisor.read(root,supervisor.SESSION)
 
+    def test_stale_recovery_request_cannot_restart_a_stopped_runtime(self):
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            app=SimpleNamespace(ROOT=root,STATE=root/'state.json',log_event=lambda *a,**k:None)
+            runtime=supervisor.Runtime(app)
+            supervisor.write(root,supervisor.SESSION,{'desired':True,'attempts':[]})
+            runtime.stop()
+            self.assertEqual(runtime.start(recovery=True)['runtime'],'offline')
+            self.assertFalse(runtime.record()['desired'])
+            runtime.closing=True
+            with self.assertRaisesRegex(ValueError,'shutting down'):runtime.start()
+
 
 class Origin(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -184,6 +197,25 @@ class SupervisorIntegrationTests(unittest.TestCase):
         self.assertEqual(Store(self.root/'state.json').load()['profiles'],before)
         self.assertFalse((self.root/supervisor.SOCKET).exists());self.assertFalse(supervisor.enabled(self.root))
         self.assertFalse(supervisor.owned(supervisor.read(self.root,supervisor.SESSION)))
+
+    def test_stop_completes_before_runtime_files_can_disappear(self):
+        self.start();owner=supervisor.read(self.root,supervisor.OWNER);record=supervisor.read(self.root,supervisor.SESSION)
+        result=json.loads(self.cli('daemon','stop').stdout)
+        self.assertFalse(result['daemon']);self.assertEqual(result['runtime'],'offline')
+        self.assertFalse(supervisor.owned(owner,False));self.assertFalse(supervisor.owned(record))
+        self.assertFalse((self.root/supervisor.SOCKET).exists())
+        shutil.rmtree(self.root)
+        self.assertFalse(supervisor.owned(record))
+
+    def test_keep_runtime_shutdown_is_explicit_and_adoptable(self):
+        self.start();owner=supervisor.read(self.root,supervisor.OWNER);record=supervisor.read(self.root,supervisor.SESSION)
+        result=json.loads(self.cli('daemon','stop','--keep-runtime').stdout)
+        self.assertFalse(result['daemon']);self.assertEqual(result['runtime'],'active')
+        self.assertFalse(supervisor.owned(owner,False));self.assertTrue(supervisor.owned(record))
+        self.request();self.cli('daemon','start')
+        adopted=self.wait_status(lambda value:value['runtime']=='active')
+        self.assertEqual(adopted['pid'],record['pid'])
+        self.cli('daemon','stop');self.assertFalse(supervisor.owned(record))
 
     def test_service_unit_preparation_is_explicit_and_never_started(self):
         path=self.home/'.config/systemd/user/khroxy-supervisor.service'

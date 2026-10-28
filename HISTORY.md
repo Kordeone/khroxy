@@ -21,6 +21,7 @@ No new tags have been created.
 - `1b643a9b871d61ff52b350bd45de6acecd33542d`: Add loopback listeners, explicit routing and native static DNS.
 - `8b7e32cd66ecc169e63c0c7bb66c8830988a0068`: Add bounded resumable explicit-candidate TCP scanning.
 - `6e4fad6fb9f01d02ba075390eff8767aa817ca63`: Add authenticated local API, automation, exports and shell documentation.
+- `1d702cea5af19680b82bb895959e3a6fe216aea8`: Prepare v0.2.0 packaging, safe upgrades and gated publication.
 
 The initial snapshot includes earlier standalone stabilization work, with
 Windscribe experiments and internal review reports excluded. The portable

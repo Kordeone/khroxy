@@ -1,0 +1,59 @@
+name: Standalone release gates
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  regression:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Syntax and shell checks
+        run: |
+          python3 -m py_compile khroxy installer.py setup.py build_release.py verify_release.py publish_release.py khroxy_lib/*.py tests_support/*.py test_*.py
+          sh -n install.sh workspace.sh docker/entrypoint.sh docker/network-guard.sh docker/scheduler.sh
+          bash -n retire-codex-xray.sh
+          shellcheck install.sh workspace.sh docker/entrypoint.sh docker/network-guard.sh docker/scheduler.sh
+      - name: Fetch checksum-pinned real engines
+        run: python3 -m tests_support.fetch_engines --output /tmp/khroxy-ci-engines
+      - name: Unit and real-engine regression
+        env:
+          KHROXY_TEST_XRAY: /tmp/khroxy-ci-engines/xray
+          KHROXY_TEST_V2RAY: /tmp/khroxy-ci-engines/v2ray
+          KHROXY_TEST_SING_BOX: /tmp/khroxy-ci-engines/sing-box
+        run: python3 -m unittest discover -v
+      - name: Reproducible packaging and clean installation
+        run: |
+          python3 build_release.py --output /tmp/khroxy-artifacts-a
+          python3 build_release.py --output /tmp/khroxy-artifacts-b
+          diff -r /tmp/khroxy-artifacts-a /tmp/khroxy-artifacts-b
+          python3 verify_release.py /tmp/khroxy-artifacts-a --xray /tmp/khroxy-ci-engines/xray
+      - name: Retain verified artifacts for the tag-only publishing job
+        if: github.ref == 'refs/tags/v0.2.0' && github.repository == 'Kordeone/khroxy'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: verified-release
+          path: /tmp/khroxy-artifacts-a/*
+          if-no-files-found: error
+          retention-days: 14
+  publish:
+    if: github.ref == 'refs/tags/v0.2.0' && github.repository == 'Kordeone/khroxy'
+    needs: regression
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: verified-release
+          path: /tmp/verified-release
+      - name: Verify again, stage draft, upload checked bytes and publish
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 publish_release.py /tmp/verified-release

@@ -1,8 +1,8 @@
 # Changelog
 
-## 0.2.0.dev10 — local reconstructed candidate
+## 0.2.0 — local reconstructed candidate
 
-Add authenticated local API, automation, exports and shell documentation.
+Prepare v0.2.0 packaging, safe upgrades and gated publication.
 
 This is a present-day reconstruction, not an original release record.
 No version tag or public release is created by this reconstruction.

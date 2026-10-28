@@ -20,7 +20,7 @@ import time
 ROOT = Path(__file__).resolve().parent
 SETTINGS = ROOT / 'workspace-settings.json'
 STAGED_XRAY = ROOT / 'docker' / 'xray'
-IMAGE = 'localhost/khroxy-ai:0.2.0.dev10'
+IMAGE = 'localhost/khroxy-ai:0.2.0'
 CONTAINER = 'khroxy-ai'
 PROXY_PORT = 20819
 DEFAULT_BUILD_PROXY_PORT = 20820  # existing native khroxy application proxy

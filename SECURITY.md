@@ -1,3 +1,21 @@
+# Standalone v0.2.0 security model
+
+The primary product is the independent rootless native CLI/TUI. It does not install a host firewall, TUN, SSH setting, desktop proxy, or privileged service. Supported local proxy services bind loopback; extra HTTP/SOCKS listeners offer authentication and Shadowsocks requires AEAD authentication. Existing application ports remain compatible and accessible to local processes. This is not process sandboxing or a host-wide VPN: an application that ignores its proxy configuration can connect outside KHROXY.
+
+Proxy-assigned application routes do not silently become direct routes. Extra routing permits direct traffic only through explicit user rules; unmatched extension traffic blocks. All-candidate failure, unavailable native control, invalid configurations, stale sessions and ambiguous rotation rollback are explicit errors/pending/offline states. Automatic selection does not restart active application sessions.
+
+SQLite state, original JSON recovery copies, credentials, private exports, runtime/session configurations and token files use mode 0600 under private mode-0700 storage. Root and code running as the same user remain trusted; this is permission-based protection, not encrypted storage. Backups intentionally contain authentication and must never be published. Repository/build allowlists exclude generated settings, databases, authentication, keys, project data, optional engine binaries and Windscribe experiments. Existing historical Git objects are not rewritten or sanitized automatically; owner review/credential rotation requires a separate deliberate decision if historical exposure is found.
+
+The supervisor verifies UID, boot ID, process start ticks, executable inode/device, exact arguments and a random launch nonce before adopting/signalling an engine. Destructive signals require pidfds. A bare PID is not sufficient. Unix IPC is mode 0600 and checks kernel peer UID; the optional HTTP API requires a private bearer token for reads and mutations, rejects public binds/browser origins/unexpected hosts, and bounds input/handlers. No arbitrary command/configuration/secret-export API exists.
+
+Generated production engine logs are disabled to avoid recording private URLs, TLS identities or authentication in a user journal. KHROXY emits sanitized failure categories, not raw validation output. TLS verification bypass is refused on new imports; incompatible engines/options are rejected before launch. Optional engines are separately trusted upstream executables, not KHROXY dependencies bundled into release artifacts. No third-party Python package is added. See `docs/ENGINES.md` for upstream licenses and supported options.
+
+Test evidence uses checksum-verified Xray/V2Ray/sing-box and local TCP/HTTP/TLS/QUIC fixtures, actual managed processes/API requests, and a disposable rootless loopback-only network namespace. It does not certify remote proxy operators, Internet availability, traffic obfuscation, every engine version, arm64, or optional-container isolation. No production services, host interfaces/firewall, SSH configuration or persistent volumes were modified during development.
+
+## Optional AI-container history and live acceptance
+
+The following container investigation/acceptance guidance remains relevant to the separate optional workspace. A successful native release does not mark these live host checks complete.
+
 # Security status — stabilization review
 
 Container runtime isolation remains a development preview pending acceptance on the actual Debian host. Native mode is a per-application proxy manager, not a network sandbox.

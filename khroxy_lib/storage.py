@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import stat
 import tempfile
 import time
 
@@ -138,12 +139,20 @@ class Store:
                 return False
             if self.legacy.is_symlink():
                 raise ValueError('Refusing symlink legacy state')
+            if self.legacy.exists():
+                info = self.legacy.stat()
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1 or info.st_size > MAX_BACKUP_BYTES:
+                    raise ValueError('Unsafe or oversized legacy state; source retained')
+                self.legacy.chmod(0o600)
             raw = self.legacy.read_bytes() if self.legacy.exists() else b'{"version":1,"profiles":{},"apps":{},"subscriptions":{}}'
             state = validate(json.loads(raw))
             backup = self.legacy.with_name(self.legacy.name + '.pre-sqlite')
             if backup.exists():
-                if backup.is_symlink() or backup.read_bytes() != raw:
-                    raise ValueError('Existing migration backup differs; review before migrating')
+                info = backup.lstat()
+                if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1 or
+                        info.st_size > MAX_BACKUP_BYTES or backup.read_bytes() != raw):
+                    raise ValueError('Existing migration backup differs or is unsafe; review before migrating')
+                backup.chmod(0o600)
             else:
                 exclusive_file(backup, raw)
             if not self.legacy.exists():

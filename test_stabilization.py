@@ -202,10 +202,13 @@ class InstallerTests(unittest.TestCase):
         state.parent.mkdir(parents=True)
         saved = {'version': 1, 'profiles': {'main': OUT}, 'apps': {}, 'subscriptions': {}, 'owner_setting': 17}
         state.write_text(json.dumps(saved))
-        with patch.object(installer.subprocess, 'run', side_effect=AssertionError('service call')):
+        with patch.object(installer.subprocess, 'run', return_value=subprocess.CompletedProcess([],3)) as calls:
             self.assertEqual(self.call('--health-interval', '60'), 0)
             self.assertEqual(self.call('--health-interval', '60'), 0)
-        new = json.loads(state.read_text())
+        self.assertTrue(all(call.args[0][2:4] == ['is-active','--quiet'] for call in calls.call_args_list))
+        self.assertEqual(json.loads(state.read_text()), saved)
+        from khroxy_lib.storage import Store
+        new = Store(state).load()
         self.assertEqual(new['profiles'], saved['profiles'])
         self.assertEqual(new['owner_setting'], 17)
         self.assertEqual(new['health_policy']['interval'], 60)

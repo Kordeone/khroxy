@@ -684,7 +684,7 @@ def build_xray_runtime(state):
     apps = state['apps']
     referenced = {resolve_profile(state, assignment) for assignment in
                   [a['profile'] for a in apps.values()] + networking.assignments(state)}
-    config = {'log': {'loglevel': 'warning'}, 'inbounds': [], 'outbounds': [],
+    config = {'log': {'loglevel': 'none', 'access': 'none', 'error': 'none'}, 'inbounds': [], 'outbounds': [],
               'routing': {'domainStrategy': 'AsIs', 'rules': []}}
     for name in sorted(referenced):
         outbound = copy.deepcopy(state['profiles'][name])
@@ -1625,7 +1625,44 @@ def cmd_update_feeds(name=None, due_only=False):
 # Xray itself, codex-xray, foreign units and system settings are never owned.
 CLEANUP_FILES = ('state.json', 'runtime.json', '.lock', '.health-lock', 'events.log', 'routing.sock', 'state.sqlite', 'state.sqlite-journal',
                  'state.json.pre-sqlite', '.migration-lock', '.supervisor-mode', '.daemon-lock',
-                 'daemon-owner.json', 'runtime-session.json', 'supervisor.sock', 'xray.pid')
+                 'daemon-owner.json', 'runtime-session.json', 'supervisor.sock', 'xray.pid', 'api-owner.json', '.api-lock', 'api.token')
+
+
+def managed_module_files():
+    directory = Path.home() / '.local/lib/khroxy/khroxy_lib'
+    from khroxy_lib.upgrading import safe
+    safe(directory, Path.home())
+    result = []
+    if directory.exists():
+        for path in sorted(directory.glob('*.py')):
+            if path.is_symlink() or not path.is_file() or not path.read_bytes().startswith(b'# KHROXY managed module'):
+                fail('Foreign installed module retained; refusing uninstall')
+            result.append(path)
+            cache = directory / '__pycache__'
+            if cache.is_symlink(): fail('Refusing module cache symlink')
+            if cache.exists():
+                for compiled in cache.glob(path.stem + '.cpython-*.pyc'):
+                    if compiled.is_symlink() or not compiled.is_file(): fail('Unsafe module cache retained')
+                    result.append(compiled)
+    return result
+
+
+def generated_purge_files():
+    result = []
+    for pattern in ('before-upgrade-*.json', 'before-restore-*.json', '.scan-*.lock'):
+        for path in ROOT.glob(pattern):
+            if path.is_symlink() or not path.is_file() or path.stat().st_uid != os.geteuid():
+                fail('Unsafe generated configuration file retained')
+            result.append(path)
+    directory = ROOT / 'sessions'
+    if directory.is_symlink(): fail('Refusing session directory symlink')
+    if directory.exists():
+        for path in directory.glob('session-*.json'):
+            if not re.fullmatch(r'session-[a-f0-9]{32}\.json', path.name): continue
+            if path.is_symlink() or not path.is_file() or path.stat().st_uid != os.geteuid():
+                fail('Unsafe generated session file retained')
+            result.append(path)
+    return result
 
 
 def cleanup_plan(purge=False):
@@ -1636,8 +1673,9 @@ def cleanup_plan(purge=False):
         'health_service': str(UNIT.with_name('khroxy-health.service')),
         'supervisor_service': str(UNIT.with_name('khroxy-supervisor.service')),
         'cli': str(Path.home() / '.local' / 'bin' / 'khroxy'),
+        'modules': [str(path) for path in managed_module_files()],
         'bashrc_hook': str(bashrc_path()),
-        'config': [str(ROOT / filename) for filename in CLEANUP_FILES] if purge else [],
+        'config': [str(ROOT / filename) for filename in CLEANUP_FILES] + [str(path) for path in generated_purge_files()] if purge else [],
     }
 
 
@@ -1677,6 +1715,8 @@ def cleanup_precheck(purge=False):
 
 def cmd_uninstall(purge=False, dry_run=False, confirmation=None):
     binary = cleanup_precheck(purge)
+    managed_module_files()
+    if purge: generated_purge_files()
     plan = cleanup_plan(purge)
     print('Uninstall scope (current user only):')
     print('  Stop/disable and remove owned service:', plan['service'])
@@ -1700,6 +1740,8 @@ def cmd_uninstall(purge=False, dry_run=False, confirmation=None):
             confirmation = input('Type PURGE KHROXY to confirm: ')
         if confirmation != 'PURGE KHROXY':
             fail('Purge confirmation not matched; nothing changed')
+    from khroxy_lib.api import stop as stop_owned_api
+    stop_owned_api(ROOT)
     supervisor_unit = UNIT.with_name('khroxy-supervisor.service')
     if supervisor_unit.exists():
         stopped = systemctl('disable', '--now', 'khroxy-supervisor.service')
@@ -1746,6 +1788,9 @@ def cmd_uninstall(purge=False, dry_run=False, confirmation=None):
     elif running():
         fail('A khroxy service is running but no owned unit exists; refusing uninstall')
     if purge and ROOT.exists():
+        for path in generated_purge_files(): path.unlink()
+        try: (ROOT / 'sessions').rmdir()
+        except OSError: pass
         for name in CLEANUP_FILES:
             (ROOT / name).unlink(missing_ok=True)
         try:
@@ -1753,6 +1798,13 @@ def cmd_uninstall(purge=False, dry_run=False, confirmation=None):
         except OSError:
             print('Unmanaged files remain in config directory; left untouched:', ROOT)
     cmd_shell_disable()
+    for path in managed_module_files(): path.unlink()
+    module_directory = Path.home() / '.local/lib/khroxy/khroxy_lib'
+    for path in (module_directory / '__pycache__', module_directory):
+        try: path.rmdir()
+        except OSError: pass
+    previous = binary.with_name('khroxy.previous')
+    if previous.is_file() and not previous.is_symlink() and 'khroxy: local-only' in previous.read_text(errors='replace')[:500]: previous.unlink()
     if binary.exists():
         binary.unlink()
     print('Uninstall complete.' + (' Managed config purged.' if purge else ' Profiles retained.'))
