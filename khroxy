@@ -39,7 +39,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 # Installed modules live beside the user CLI, not in user profile storage.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'lib' / 'khroxy'))
 from khroxy_lib import VERSION
-from khroxy_lib import importing
+from khroxy_lib import importing, engines
 from khroxy_lib.storage import Store
 from khroxy_lib.cli import dispatch as extended_cli
 
@@ -511,7 +511,7 @@ def switch_fastest_live(old, proposed):
     No outbound removal, signal, process restart, or fixed-route changes. Legacy
     gateways and newly edited profiles defer until an explicit maintenance stop.
     """
-    if not proposed.get('session_safe_fastest') or not RUNTIME.is_file():
+    if proposed.get('engine', 'xray') != 'xray' or not proposed.get('session_safe_fastest') or not RUNTIME.is_file():
         return False
     desired = build_runtime(proposed)
     try:
@@ -620,7 +620,19 @@ def test_profiles(names, select_fastest=False):
             cmd_unit()
 
 
+def selected_engine(state=None):
+    state = load() if state is None else state
+    name = state.get('engine', 'xray')
+    return name, engines.discover(name, state, XRAY)
+
+
 def build_runtime(state):
+    name = state.get('engine', 'xray')
+    base = state if name == 'xray' else dict(state, session_safe_fastest=False)
+    return engines.adapt(build_xray_runtime(base), name)
+
+
+def build_xray_runtime(state):
     apps = state['apps']
     referenced = {resolve_profile(state, a['profile']) for a in apps.values()}
     config = {'log': {'loglevel': 'warning'}, 'inbounds': [], 'outbounds': [],
@@ -678,20 +690,10 @@ def build_runtime(state):
 
 
 def xray_test(payload):
-    if not XRAY.is_file() or not os.access(XRAY, os.X_OK):
-        fail('Xray not found at ' + str(XRAY))
-    fd, name = tempfile.mkstemp(prefix='.khroxy-test-', suffix='.json', dir=ROOT)
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, 'wb') as file:
-            file.write(payload)
-        result = subprocess.run([str(XRAY), 'run', '-test', '-config', name],
-                                text=True, capture_output=True, timeout=20)
-        if result.returncode:
-            # Xray errors may embed server names; report locally only.
-            fail('Xray config validation failed:\n' + (result.stderr or result.stdout)[-800:])
-    finally:
-        os.unlink(name)
+    # Xray errors may embed server names; report locally only.
+    # All supported engines now withhold raw validation output, including secrets.
+    name, binary = selected_engine()
+    engines.validate(binary, name, json.loads(payload), ROOT)
 
 
 def _container_owned_pid():
@@ -702,7 +704,7 @@ def _container_owned_pid():
         cmd = Path(f'/proc/{pid}/cmdline').read_bytes().replace(b'\x00', b' ').decode(errors='replace')
         uid_line = next(x for x in Path(f'/proc/{pid}/status').read_text().splitlines()
                         if x.startswith('Uid:'))
-        if (str(XRAY) in cmd and str(RUNTIME) in cmd and
+        if (str(selected_engine()[1]) in cmd and str(RUNTIME) in cmd and
                 int(uid_line.split()[1]) == os.geteuid()):
             return pid
     except (OSError, ValueError, StopIteration):
@@ -733,7 +735,7 @@ def _container_ctl(*args):
             config = json.loads(RUNTIME.read_text())
             if not config.get('inbounds'): return done(1, 'No configured proxy listener')
             # Use a detached process; no root-capable Xray in this mode.
-            proc = subprocess.Popen([str(XRAY), 'run', '-config', str(RUNTIME)],
+            proc = subprocess.Popen(engines.command(selected_engine()[1], selected_engine()[0], RUNTIME),
                                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                     stderr=subprocess.DEVNULL, start_new_session=True)
             write_file(CONTAINER_PID, (str(proc.pid) + '\n').encode())
@@ -857,6 +859,9 @@ def cmd_import(state, name, allow_plaintext=False):
     outbound = parse_share(link, allow_plaintext)
     existing = next((key for key,value in state['profiles'].items() if importing.fingerprint(value) == importing.fingerprint(outbound)), None)
     if existing:
+        proposed = copy.deepcopy(state)
+        proposed['manual_profiles'] = sorted(set(state.get('manual_profiles', [])) | {existing})
+        write_file(STATE, serial(proposed))
         print('Profile already imported as', existing, '; no duplicate added')
         return
     proposed = copy.deepcopy(state)
@@ -990,6 +995,12 @@ def cmd_shell_disable():
     print('Removed khroxy bash hook (open shells need a new session)')
 
 
+def systemd_word(value):
+    text = str(value)
+    if any(ord(ch) < 32 for ch in text): fail('Invalid control character in service path')
+    return '"' + text.replace('\\', '\\\\').replace('"', '\\"').replace('%', '%%').replace('$', '$$') + '"'
+
+
 def cmd_unit():
     if CONTAINER_MODE:
         st = load()
@@ -1015,7 +1026,7 @@ def cmd_unit():
                 '[Unit]\nDescription=khroxy private per-app Xray proxy\n'
                 'After=network-online.target\nWants=network-online.target\n\n'
                 '[Service]\nType=simple\n'
-                f'ExecStart={XRAY} run -config {RUNTIME}\n'
+                'ExecStart=' + ' '.join(systemd_word(v) for v in engines.command(selected_engine()[1], selected_engine()[0], RUNTIME)) + '\n'
                 'Restart=on-failure\nRestartSec=3\nNoNewPrivileges=true\n'
                 'UMask=0077\n\n'
                 '[Install]\nWantedBy=default.target\n')
@@ -1204,8 +1215,8 @@ def make_sub_profiles(subname, parsed):
 @contextmanager
 def temporary_profile_proxy(outbound):
     """Temporary local Xray listener to fetch a feed through an unassigned profile."""
-    if not XRAY.is_file() or not os.access(XRAY, os.X_OK):
-        fail('Xray executable is missing')
+    state = load()
+    chosen = state.get('engine', 'xray')
     with socket.socket() as sk:
         sk.bind(('127.0.0.1', 0))
         port = sk.getsockname()[1]
@@ -1215,17 +1226,29 @@ def temporary_profile_proxy(outbound):
               'outbounds': [dict(copy.deepcopy(outbound), tag='feed-out')],
               'routing': {'rules': [{'type': 'field', 'inboundTag': ['feed'],
                                      'outboundTag': 'feed-out'}]}}
+    usable = None
+    for candidate in dict.fromkeys((chosen, *engines.NAMES)):
+        binary = engines.discover(candidate, state, XRAY)
+        if not binary.is_file(): continue
+        try:
+            rendered = engines.adapt(config, candidate)
+            usable = candidate, binary, rendered
+            break
+        except ValueError:
+            continue
+    if usable is None: fail('No installed engine can represent this profile; no direct fallback')
+    engine_name, binary, config = usable
     fd, tmp = tempfile.mkstemp(prefix='.khroxy-feed-', suffix='.json', dir=ROOT)
     proc = None
     try:
         os.fchmod(fd, 0o600)
         with os.fdopen(fd, 'wb') as file:
             file.write(serial(config))
-        test = subprocess.run([str(XRAY), 'run', '-test', '-config', tmp],
+        test = subprocess.run(engines.command(binary, engine_name, tmp, check=True),
                               capture_output=True, timeout=20)
         if test.returncode:
             fail('Profile cannot start (Xray validation failed; details withheld)')
-        proc = subprocess.Popen([str(XRAY), 'run', '-config', tmp],
+        proc = subprocess.Popen(engines.command(binary, engine_name, tmp),
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                 start_new_session=True)
         if not listener_ready(port, tries=8) or proc.poll() is not None:

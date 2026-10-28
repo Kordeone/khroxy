@@ -11,6 +11,7 @@ import sys
 
 import setup
 from khroxy_lib.storage import Store
+from khroxy_lib import engines
 
 ROOT = Path(__file__).resolve().parent
 
@@ -31,8 +32,11 @@ def native_install(args):
     setup.agent_uid()
     home = Path.home()
     cli = home / '.local/bin/khroxy'
-    xray = home / '.local/bin/xray'
     state = home / '.config/khroxy/state.json'
+    saved = Store(state).load() if Store(state).exists else json.loads(state.read_text()) if state.exists() else {'version': 1, 'profiles': {}, 'apps': {}, 'subscriptions': {}}
+    engine = args.proxy_engine or saved.get('engine','xray')
+    if engine not in engines.NAMES: raise setup.SetupError('Invalid saved proxy engine')
+    xray = home / '.local/bin' / engine
     runtime = state.with_name('runtime.json')
     unit = home / '.config/systemd/user/khroxy.service'
     health_unit = unit.with_name('khroxy-health.service')
@@ -41,13 +45,21 @@ def native_install(args):
     for path in (unit, health_unit):
         if path.exists() and not path.read_text().startswith('# Managed by khroxy\n'):
             raise setup.SetupError(f'Existing foreign unit retained: {path}')
+    if engine != saved.get('engine','xray') and unit.exists():
+        active = subprocess.run(['systemctl','--user','is-active','--quiet','khroxy.service'],capture_output=True,timeout=5)
+        if active.returncode == 0:
+            raise setup.SetupError('Stop the managed proxy before changing the installed engine; sessions are not interrupted')
     if cli.exists() and 'khroxy: local-only' not in cli.read_text(errors='replace')[:500]:
         raise setup.SetupError('Existing ~/.local/bin/khroxy is not recognized; refusing overwrite')
-    binary = setup.xray_source(args.xray)
+    if args.xray and engine != 'xray':
+        raise setup.SetupError('Use --engine-binary with a non-Xray proxy engine')
+    binary = Path(args.engine_binary).expanduser().resolve() if args.engine_binary else setup.xray_source(args.xray) if engine == 'xray' else engines.discover(engine,saved)
+    if engine != 'xray': engines.identify(binary, engine)
     setup.check_elf_xray(binary)
     if xray.exists() and binary != xray.resolve() and binary.read_bytes() != xray.read_bytes():
         raise setup.SetupError('Existing Xray retained; omit --xray or select the installed binary')
-    saved = Store(state).load() if Store(state).exists else json.loads(state.read_text()) if state.exists() else {'version': 1, 'profiles': {}, 'apps': {}, 'subscriptions': {}}
+    saved['engine'] = engine
+    saved.setdefault('engine_binaries',{})[engine] = str(xray)
     loader = importlib.machinery.SourceFileLoader('khroxy_installer', str(ROOT / 'khroxy'))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     mod = importlib.util.module_from_spec(spec)
@@ -63,7 +75,7 @@ def native_install(args):
     proxy_unit = ('# Managed by khroxy\n[Unit]\nDescription=khroxy private per-app Xray proxy\n'
                   f'ConditionPathExists={systemd_arg(runtime)}\nAfter=network-online.target\n\n'
                   '[Service]\nType=simple\n'
-                  f'ExecStart={systemd_arg(xray)} run -config {systemd_arg(runtime)}\n'
+                  'ExecStart=' + ' '.join(systemd_arg(arg) for arg in engines.command(xray,engine,runtime)) + '\n'
                   'Restart=on-failure\nRestartSec=3\nNoNewPrivileges=true\nUMask=0077\n\n'
                   '[Install]\nWantedBy=default.target\n')
     health_contents = ('# Managed by khroxy\n[Unit]\nDescription=khroxy periodic profile health checks\n\n'
@@ -71,7 +83,7 @@ def native_install(args):
                        f'ExecStart={systemd_arg(cli)} health-watch\n'
                        'Restart=on-failure\nRestartSec=10\nNoNewPrivileges=true\nUMask=0077\n\n'
                        '[Install]\nWantedBy=default.target\n')
-    print('Native plan: install ~/.local/bin/khroxy, trusted Xray if absent, user proxy and health units.')
+    print(f'Native plan: install ~/.local/bin/khroxy, trusted {engine} if absent, user proxy and health units.')
     print(f'Health interval: {policy["interval"]} seconds. Existing profiles/settings retained.')
     print('Fastest changes use a private routing API without restarting sessions; legacy gateways defer until maintenance.')
     if args.dry_run:
@@ -97,6 +109,8 @@ def native_install(args):
                 raise setup.SetupError('Unsupported state version; no files changed')
             current['health_policy'] = policy
             current['session_safe_fastest'] = True
+            current['engine'] = engine
+            current.setdefault('engine_binaries',{})[engine] = str(xray)
             saved = current
         for path in (cli, xray, unit):
             path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -139,6 +153,8 @@ def main(argv=None):
     parser.add_argument('--mode', choices=('native', 'container'))
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--xray')
+    parser.add_argument('--proxy-engine', choices=engines.NAMES)
+    parser.add_argument('--engine-binary')
     parser.add_argument('--health-interval', type=int)
     parser.add_argument('--enable-services', action='store_true', help='Ask explicitly before enabling user services')
     args, extra = parser.parse_known_args(argv)
@@ -154,7 +170,7 @@ def main(argv=None):
             if extra:
                 parser.error('Unknown native options: ' + ' '.join(extra))
             return native_install(args)
-        if args.health_interval is not None or args.enable_services:
+        if args.health_interval is not None or args.enable_services or args.proxy_engine or args.engine_binary:
             parser.error('Health interval / user services options apply to native mode only')
         if not any(arg == '--engine' or arg.startswith('--engine=') for arg in extra) and sys.stdin.isatty():
             default = 'podman'

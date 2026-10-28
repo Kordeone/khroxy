@@ -6,8 +6,12 @@ from .storage import Store
 
 
 def dispatch(app, argv):
-    if not argv or argv[0] not in ('storage', 'profile', 'import-data'):
+    if not argv or argv[0] not in ('storage', 'profile', 'import-data', 'engine'):
         return False
+    if argv[0] == 'engine':
+        from .engines import cli
+        cli(app, argv[1:])
+        return True
     parser = argparse.ArgumentParser(prog='khroxy ' + argv[0])
     if argv[0] == 'import-data':
         parser.add_argument('--file')

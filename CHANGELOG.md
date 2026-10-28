@@ -1,8 +1,8 @@
 # Changelog
 
-## 0.2.0.dev2 — local reconstructed candidate
+## 0.2.0.dev3 — local reconstructed candidate
 
-Expand bounded imports with deduplication and shared source ownership.
+Support optional Xray, V2Ray and sing-box engines.
 
 This is a present-day reconstruction, not an original release record.
 No version tag or public release is created by this reconstruction.
