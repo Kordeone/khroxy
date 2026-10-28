@@ -1,3 +1,5 @@
+KHROXY v0.2.0 is a local reconstructed release candidate; no publication is claimed. See [source provenance](HISTORY.md).
+
 # KHROXY
 
 KHROXY is an independent Linux proxy manager: a compact terminal UI, private per-application proxies, subscriptions, optional background supervision, health testing and automatic Fastest selection. It uses supported proxy engines directly. XRAT was a documentation-only functional reference; XRAT, Windscribe and external controllers are not runtime dependencies.
@@ -7,7 +9,7 @@ The original btop-like terminal identity is preserved: **Profiles, Applications,
 
 ## Choose an installation
 
-**Native Linux is the primary product.** It manages local applications without a container or host-wide VPN. The optional AI workspace adds Node.js/npm/npx/Codex in a container; its live Debian firewall acceptance remains separate and unverified. Historical Windscribe experiments remain in Git history and `windscribe/`, outside standalone release artifacts.
+**Native Linux is the primary product.** It manages local applications without a container or host-wide VPN. The optional AI workspace adds Node.js/npm/npx/Codex in a container; its live Debian firewall acceptance remains separate and unverified. Windscribe experiments are excluded from this reconstructed branch and its release artifacts; original source history is preserved separately.
 
 You need Linux, Python 3.10 or newer, `curl`, and at least one trusted compatible proxy engine. Xray is the original default; V2Ray and sing-box are optional alternatives. Obtain binaries from their official releases, verify the upstream checksums, and choose the matching CPU architecture. KHROXY does not download or install system packages automatically. Tests currently cover Linux amd64 with the versions in [ENGINE_LOCK.json](ENGINE_LOCK.json); the native installer also recognizes arm64 ELF binaries, without claiming arm64 release acceptance.
 
@@ -187,3 +189,5 @@ For the optional container, stop only `khroxy-ai`, then remove that stopped cont
 No network test is described as live Internet verification when it used local fixtures. Development never changes production host networking or restarts unrelated live services.
 
 Source lineage and normalized versions: [HISTORY.md](HISTORY.md).
+
+Default `NO_PROXY` exemptions cover only `localhost`, `127.0.0.1` and `::1`. LAN addresses and local domains use the configured proxy.

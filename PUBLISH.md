@@ -1,6 +1,6 @@
 # Publish the independent standalone release
 
-Publish only after every mandatory gate in `docs/TASKS.md` and `RELEASE_AUDIT.md` passes. Build and verify artifacts from the exact clean committed development revision as described in `docs/RELEASE.md`; retain the successful test log and artifact checksums.
+Publish only after the regression, installation, privacy and artifact checks pass. Build and verify artifacts from the exact clean committed development revision as described in `docs/RELEASE.md`; retain the successful test log and artifact checksums.
 
 Do not initialize a new repository, rewrite history, merge into main, deploy a container, or include workspace settings/credentials. Publish a tag/release that points to the tested commit, with unchanged verified source/zipapp/checksum assets and accurate limitations. The GitHub release must not claim live-verified optional container isolation, public-network verification, or unsupported XRAT parity.
 

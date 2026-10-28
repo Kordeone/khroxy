@@ -15,15 +15,19 @@ from khroxy_lib import VERSION
 ROOT=Path(__file__).resolve().parent
 TOP=('HISTORY.md','khroxy','installer.py','install.sh','setup.py','workspace.sh','compose.yaml',
      'build_release.py','verify_release.py','publish_release.py','README.md','CHANGELOG.md','SECURITY.md',
-     'PUBLISH.md','ENGINE_LOCK.json','retire-codex-xray.sh')
+     'PUBLISH.md','ENGINE_LOCK.json','retire-codex-xray.sh','.gitattributes')
 
+DOCS=('AUTOMATION.md','DIAGNOSTICS.md','ENGINES.md','IMPORTS.md','NETWORKING.md',
+      'RELEASE.md','RELEASE_NOTES.md','ROTATION.md','SCANNING.md','STORAGE.md',
+      'SUPERVISOR.md','TESTING.md','khroxy.1','tui-baseline.json')
 
 def inputs(root=None,allow_untracked=False):
     root=ROOT if root is None else root
     names=set(TOP)
+    names.update('docs/'+name for name in DOCS)
     names.update('docker/'+name for name in ('Dockerfile','Containerfile','entrypoint.sh','network-guard.sh','scheduler.sh','runtime-paths.py','verify-isolation.py','caveman.py','.env.example'))
     names.update(('.gitignore','.dockerignore','.containerignore'))
-    for directory,pattern in (('khroxy_lib','*.py'),('tests_support','*.py'),('docs','*.md'),('docs','*.json'),('docs','*.1'),('completions','*'),('.github/workflows','*.yml')):
+    for directory,pattern in (('khroxy_lib','*.py'),('tests_support','*.py'),('completions','*'),('.github/workflows','*.yml')):
         names.update(str(p.relative_to(root)) for p in (root/directory).glob(pattern) if p.is_file())
     names.update(p.name for p in root.glob('test_*.py'))
     tracked=None

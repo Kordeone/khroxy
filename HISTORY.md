@@ -27,3 +27,12 @@ The initial snapshot includes earlier standalone stabilization work, with
 Windscribe experiments and internal review reports excluded. The portable
 TUI contract test is carried forward from the final original snapshot.
 The legacy compatibility fixture has a privacy-sanitized NO_PROXY default; TUI function ASTs remain unchanged.
+
+## Privacy and release preparation
+
+The final commit adds explicit public-document packaging boundaries and privacy
+regressions reviewed independently. Personal infrastructure wording and stale
+image examples were corrected in every reconstruction snapshot. Runtime and
+test source bytes for those documentation-only revisions match the snapshots
+that passed the recorded regression suites. Source commit IDs identify input
+lineage; the old publication records are not claims about this candidate.

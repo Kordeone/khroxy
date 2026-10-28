@@ -8,7 +8,7 @@ services:
       args:
         AGENT_UID: ${AGENT_UID:-1000}
         CAVEMAN_SUITE: "none"
-    image: localhost/khroxy-ai:0.9.1
+    image: localhost/khroxy-ai:0.2.0
     cap_drop: [ALL]
     cap_add: [NET_ADMIN, SETUID, SETGID, CHOWN]
     security_opt: [no-new-privileges:true]

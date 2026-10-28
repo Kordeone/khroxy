@@ -1,0 +1,22 @@
+# Keep private development material out of Git-generated source archives.
+.agents export-ignore
+.codex export-ignore
+.aws export-ignore
+.ssh export-ignore
+AGENTS.md export-ignore
+CLAUDE.md export-ignore
+**/AGENTS.md export-ignore
+**/CLAUDE.md export-ignore
+RELEASE_AUDIT.md export-ignore
+STABILIZATION_REVIEW.md export-ignore
+STARTUP_FIX_REVIEW.md export-ignore
+docs/TASKS.md export-ignore
+docs/FINAL_REPORT.md export-ignore
+docs/BASELINE.md export-ignore
+docs/PARITY.md export-ignore
+workspace-settings.json export-ignore
+workspace.json export-ignore
+compose.local.yaml export-ignore
+windscribe export-ignore
+dist export-ignore
+build export-ignore
