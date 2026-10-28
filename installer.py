@@ -112,6 +112,7 @@ def native_install(args):
             current['engine'] = engine
             current.setdefault('engine_binaries',{})[engine] = str(xray)
             saved = current
+        engines.prepare_management(saved)
         for path in (cli, xray, unit):
             path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         if cli.exists() and cli.read_bytes() != (ROOT / 'khroxy').read_bytes():

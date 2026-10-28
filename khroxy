@@ -39,7 +39,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 # Installed modules live beside the user CLI, not in user profile storage.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'lib' / 'khroxy'))
 from khroxy_lib import VERSION
-from khroxy_lib import importing, engines
+from khroxy_lib import importing, engines, rotation
 from khroxy_lib.storage import Store
 from khroxy_lib.cli import dispatch as extended_cli
 
@@ -403,9 +403,9 @@ def probe_profile(outbound):
     return {'ok': False, 'ms': None, 'time': int(time.time()), 'category': failure}
 
 def choose_best(state, max_age=900):
-    now = int(time.time())
+    now = time.time()
     valid = [(item['ms'], name) for name, item in state.get('health', {}).items()
-             if name in state['profiles'] and item.get('ok') and
+             if rotation.eligible(state, name, now) and item.get('ok') and
              isinstance(item.get('ms'), (int, float)) and item['ms'] >= 0 and
              0 <= now - item.get('time', 0) <= max_age]
     return min(valid)[1] if valid else None
@@ -438,7 +438,7 @@ def choose_stable_best(state):
     return best if gain >= threshold else current
 
 
-def background_health():
+def background_health(force_rotation=False):
     """Probe out of lock; select under lock. Never restart a running gateway."""
     ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
     worker = os.open(ROOT / '.health-lock', os.O_RDWR | os.O_CREAT, 0o600)
@@ -451,6 +451,7 @@ def background_health():
         snapshot = load()
         results = {}
         for name, outbound in snapshot['profiles'].items():
+            if not rotation.eligible(snapshot, name): continue
             results[name] = probe_profile(outbound)
             print(safe_label(name), f"{results[name]['ms']} ms" if results[name]['ok'] else 'FAIL')
         fd = lock()
@@ -464,7 +465,9 @@ def background_health():
                     if Store(STATE).exists:
                         Store(STATE).append('measurements', name, dict(result, configuration_hash=importing.fingerprint(old['profiles'][name])), result.get('time',time.time()))
                     log_event('probe_ok' if result['ok'] else 'probe_fail', name)
-            best = choose_stable_best(new)
+            rotation.observe(new, {name:result for name,result in results.items() if old['profiles'].get(name)==snapshot['profiles'][name]})
+            best, rotation_reason = rotation.choose(SimpleNamespace(**globals()), new, force=force_rotation)
+            if old.get('rotation_error'): best = old.get('fastest_profile'); rotation_reason = 'suspended'
             new['health_checked_at'] = int(time.time())
             if best is None:
                 new['health_status'] = 'No healthy profiles; existing routes retained; no direct fallback'
@@ -476,25 +479,33 @@ def background_health():
                 try:
                     desired = build_runtime(proposed)
                     installed = json.loads(RUNTIME.read_text()) if RUNTIME.is_file() else build_runtime(old)
-                    changed = desired != installed or (not RUNTIME.is_file() and bool(desired['inbounds']))
+                    changed = desired != installed or desired != build_runtime(old) or (not RUNTIME.is_file() and bool(desired['inbounds']))
                 except ValueError:
                     changed = True
                 live = changed and running()
                 switched = live and switch_fastest_live(old, proposed)
                 if live and not switched:
                     new['pending_fastest'] = best
+                    if proposed.get('rotation_error'): new['rotation_error'] = proposed['rotation_error']
                     new['health_status'] = 'Fastest pending: ' + best + '; safe routing API unavailable, restart deferred to preserve sessions'
                     log_event('health_deferred', best)
                 else:
                     new = proposed
                     new.pop('pending_fastest', None)
-                    new['health_status'] = 'Fastest: ' + best
+                    new['health_status'] = 'Fastest: ' + best + (' (' + rotation_reason + ')' if rotation_reason != 'latency' else '')
                     if changed and not switched:
                         commit(old, new)
+                    rotation.note_switch(SimpleNamespace(**globals()), old, new, rotation_reason)
                     log_event('health_selected', best)
             write_file(STATE, serial(new))
+            if rotation_reason == 'pinned' and not new.get('health',{}).get(best,{}).get('ok'):
+                new['health_status'] = 'Pinned profile unavailable; existing route retained; no direct fallback'
+                write_file(STATE, serial(new))
+            if new.get('rotation_error'):
+                new['health_status'] = 'Rotation target unverified; automatic changes suspended; inspect rotation status'
+                write_file(STATE, serial(new))
             print(new['health_status'], flush=True)
-            if best is None:
+            if best is None or (rotation_reason == 'pinned' and not new.get('health',{}).get(best,{}).get('ok')):
                 fail(new['health_status'])
         finally:
             os.close(fd)
@@ -517,7 +528,10 @@ def switch_fastest_live(old, proposed):
     No outbound removal, signal, process restart, or fixed-route changes. Legacy
     gateways and newly edited profiles defer until an explicit maintenance stop.
     """
-    if proposed.get('engine', 'xray') != 'xray' or not proposed.get('session_safe_fastest') or not RUNTIME.is_file():
+    if proposed.get('engine') == 'sing-box':
+        from khroxy_lib.rotation import switch_sing
+        return switch_sing(SimpleNamespace(**globals()), old, proposed)
+    if not proposed.get('session_safe_fastest') or not RUNTIME.is_file():
         return False
     desired = build_runtime(proposed)
     try:
@@ -534,17 +548,26 @@ def switch_fastest_live(old, proposed):
         check_name(target)
         previous = RUNTIME.read_bytes()
         write_file(RUNTIME, serial(desired))
+        def restore_target():
+            write_file(RUNTIME, previous)
+            try:
+                rollback = subprocess.run([str(selected_engine(proposed)[1]), 'api', 'bo',
+                    '--server=unix://' + str(ROOT / 'routing.sock'), '-b', 'khroxy-fastest',
+                    'profile-' + old['fastest_profile'] + '#'], capture_output=True, text=True, timeout=6)
+                if rollback.returncode: proposed['rotation_error'] = 'target-unverified; automatic changes suspended'
+            except (OSError, KeyError, subprocess.TimeoutExpired):
+                proposed['rotation_error'] = 'target-unverified; automatic changes suspended'
         try:
-            result = subprocess.run([str(XRAY), 'api', 'bo',
+            result = subprocess.run([str(selected_engine(proposed)[1]), 'api', 'bo',
                 '--server=unix://' + str(ROOT / 'routing.sock'),
                 '-b', 'khroxy-fastest', 'profile-' + target + '#'],
                 capture_output=True, text=True, timeout=6)
         except (OSError, subprocess.TimeoutExpired):
-            write_file(RUNTIME, previous)
+            restore_target()
             log_event('health_api_fail', detail='unavailable')
             return False
         if result.returncode:
-            write_file(RUNTIME, previous)
+            restore_target()
             log_event('health_api_fail', detail='unavailable')
             return False
         return True
@@ -636,8 +659,7 @@ def selected_engine(state=None):
 
 def build_runtime(state):
     name = state.get('engine', 'xray')
-    base = state if name == 'xray' else dict(state, session_safe_fastest=False)
-    return engines.adapt(build_xray_runtime(base), name)
+    return engines.adapt(build_xray_runtime(state), name, state.get('engine_management',{}).get(name))
 
 
 def build_xray_runtime(state):

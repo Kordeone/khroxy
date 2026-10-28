@@ -17,7 +17,7 @@ Selection validates the native configuration before storing state. It does not s
 
 Existing JSON outbounds stay in the canonical format, so switching engines does not mutate credentials or source ownership. Supported combinations include VLESS, VMess, Trojan, Shadowsocks, HTTP/HTTPS and SOCKS5 with the three engines; Hysteria2 uses sing-box. Xray-only XHTTP/ECH options, REALITY post-quantum fields, or unsupported gRPC/mux/transport options are rejected when another adapter cannot represent them. No option is silently stripped to make a configuration pass.
 
-Fastest's live Unix routing API is currently an Xray capability. Other cores defer automatic route changes while running, preserving sessions; a planned stop/health/start adopts the new route. Closing the TUI never owns a foreground proxy's lifecycle.
+Session-safe Fastest now uses private native Unix routing APIs for Xray/V2Ray and an authenticated loopback selector API for sing-box. Existing streams and fixed assignments remain unchanged. Legacy or changed candidate pools still need planned maintenance; see [rotation policy and recovery](ROTATION.md). Closing the TUI never owns a foreground proxy's lifecycle.
 
 A native install can use sing-box without installing Xray:
 

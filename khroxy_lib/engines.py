@@ -6,6 +6,8 @@ import os
 from pathlib import Path
 import re
 import shutil
+import secrets
+import socket
 import subprocess
 import tempfile
 
@@ -125,7 +127,7 @@ def sing_outbound(node):
     return out
 
 
-def adapt(config, name):
+def adapt(config, name, management=None):
     if name not in NAMES: raise ValueError('Unknown proxy engine')
     if name=='xray':
         if any(n.get('protocol') not in CAPABILITIES['xray']|{'blackhole','freedom'} for n in config['outbounds']):
@@ -141,9 +143,26 @@ def adapt(config, name):
                 raise ValueError('Xray TLS/ECH options unsupported by V2Ray adapter')
             for server in node.get('settings',{}).get('vnext',[]):
                 if any(user.get('flow') for user in server.get('users',[])): raise ValueError('VLESS flow unsupported by V2Ray adapter')
-        if 'api' in config: raise ValueError('Xray routing API configuration cannot be translated to V2Ray')
+        if 'api' in config:
+            config=copy.deepcopy(config)
+            path=config['api'].pop('listen',None)
+            if not isinstance(path,str) or not path.startswith('/'):
+                raise ValueError('V2Ray routing API requires a private Unix socket')
+            tag=config['api']['tag']
+            config['inbounds'].append({'tag':tag,'port':1,'listen':'127.0.0.1','protocol':'dokodemo-door',
+                'settings':{'address':'127.0.0.1','network':'tcp'},
+                'streamSettings':{'network':'domainsocket','dsSettings':{'path':path}}})
+            config['routing']['rules'].insert(0,{'type':'field','inboundTag':[tag],'outboundTag':tag})
         return config
     out={'log':{'level':'warn'},'inbounds':[],'outbounds':[],'route':{'rules':[]}}
+    if 'api' in config:
+        if not management or not 1024<=management.get('port',0)<=65535 or len(management.get('secret',''))<32:
+            raise ValueError('Initialize private engine management before live Fastest')
+        out['experimental']={'clash_api':{'external_controller':f"127.0.0.1:{management['port']}",
+            'secret':management['secret'],'access_control_allow_origin':['http://127.0.0.1']}}
+        selector=config['routing']['balancers'][0]['selector'][0]
+        out['outbounds'].append({'type':'selector','tag':'khroxy-fastest','outbounds':[n['tag'] for n in config['outbounds'] if n['protocol']!='blackhole'],
+                                'default':selector,'interrupt_exist_connections':False})
     for node in config['outbounds']:
         if node['protocol']=='blackhole': continue
         if node['protocol']=='freedom': out['outbounds'].append({'type':'direct','tag':node['tag']})
@@ -152,15 +171,15 @@ def adapt(config, name):
         if inbound['protocol'] not in ('http','socks'): raise ValueError('Inbound unsupported by sing-box adapter')
         out['inbounds'].append({'type':inbound['protocol'],'tag':inbound['tag'],'listen':inbound['listen'],'listen_port':inbound['port']})
     for rule in config['routing']['rules']:
-        keys(rule,('type','inboundTag','outboundTag'),'routing')
-        target=rule['outboundTag']
+        keys(rule,('type','inboundTag','outboundTag','balancerTag'),'routing')
+        target=rule.get('outboundTag',rule.get('balancerTag'))
         out['route']['rules'].append(dict(inbound=rule['inboundTag'],**({'action':'reject'} if target=='khroxy-offline' else {'action':'route','outbound':target})))
     out['route']['rules'].append({'action':'reject'})
     return out
 
 
 def redact(value):
-    sensitive={'settings','streamSettings','tls','transport','headers','address','server','serverName','server_name','password','pass','user','username','id','uuid','privateKey','publicKey','shortId','short_id','echConfigList'}
+    sensitive={'settings','streamSettings','tls','transport','headers','secret','token','authorization','address','server','serverName','server_name','password','pass','user','username','id','uuid','privateKey','publicKey','shortId','short_id','echConfigList'}
     if isinstance(value,dict): return {k:'<redacted>' if k in sensitive else redact(v) for k,v in value.items()}
     if isinstance(value,list): return [redact(v) for v in value]
     return value
@@ -196,6 +215,7 @@ def cli(app, argv):
             for name in candidates:
                 proposed=copy.deepcopy(state); proposed['engine']=name
                 if args.binary: proposed.setdefault('engine_binaries',{})[name]=str(Path(args.binary).expanduser().resolve())
+                prepare_management(proposed)
                 binary=discover(name,proposed,app.XRAY)
                 try:
                     config=app.build_runtime(proposed)
@@ -234,3 +254,11 @@ def cli(app, argv):
         raise ValueError('Secrets may only be written to an explicit private --output file')
     else:
         print(json.dumps(redact(config),indent=2))
+
+
+def prepare_management(state):
+    if state.get('engine','xray')!='sing-box': return
+    if state.get('engine_management',{}).get('sing-box'): return
+    with socket.socket() as sock:
+        sock.bind(('127.0.0.1',0));port=sock.getsockname()[1]
+    state.setdefault('engine_management',{})['sing-box']={'port':port,'secret':secrets.token_urlsafe(32)}

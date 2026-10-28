@@ -26,7 +26,7 @@ __pycache__/
 /dist/
 /build/
 
-# Experimental packages and v0.2.0.dev5 local databases/artifacts.
+# Experimental packages and v0.2.0.dev6 local databases/artifacts.
 /windscribe/*.deb
 *.sqlite
 *.sqlite-*
