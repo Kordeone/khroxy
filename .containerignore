@@ -12,3 +12,6 @@ docker/**
 !docker/verify-isolation.py
 !docker/caveman.py
 !docker/runtime-paths.py
+!khroxy_lib
+khroxy_lib/**
+!khroxy_lib/*.py

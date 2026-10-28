@@ -10,6 +10,7 @@ import subprocess
 import sys
 
 import setup
+from khroxy_lib.storage import Store
 
 ROOT = Path(__file__).resolve().parent
 
@@ -46,7 +47,7 @@ def native_install(args):
     setup.check_elf_xray(binary)
     if xray.exists() and binary != xray.resolve() and binary.read_bytes() != xray.read_bytes():
         raise setup.SetupError('Existing Xray retained; omit --xray or select the installed binary')
-    saved = json.loads(state.read_text()) if state.exists() else {'version': 1, 'profiles': {}, 'apps': {}, 'subscriptions': {}}
+    saved = Store(state).load() if Store(state).exists else json.loads(state.read_text()) if state.exists() else {'version': 1, 'profiles': {}, 'apps': {}, 'subscriptions': {}}
     loader = importlib.machinery.SourceFileLoader('khroxy_installer', str(ROOT / 'khroxy'))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     mod = importlib.util.module_from_spec(spec)
@@ -76,6 +77,12 @@ def native_install(args):
     if args.dry_run:
         print('DRY RUN: no files or services changed')
         return 0
+    modules = list((ROOT / 'khroxy_lib').glob('*.py'))
+    for source in modules:
+        target = home / '.local/lib/khroxy/khroxy_lib' / source.name
+        safe_path(target, home)
+        if target.exists() and not target.read_text().startswith('# KHROXY managed module'):
+            raise setup.SetupError('Foreign module retained; refusing overwrite')
     # Installation does not restart a running gateway, including during upgrades.
     fd = None
     try:
@@ -85,7 +92,7 @@ def native_install(args):
         mod.STATE = state
         fd = mod.lock()
         if state.exists():
-            current = json.loads(state.read_text())
+            current = Store(state).load() if Store(state).exists else json.loads(state.read_text())
             if current.get('version') != 1:
                 raise setup.SetupError('Unsupported state version; no files changed')
             current['health_policy'] = policy
@@ -95,10 +102,18 @@ def native_install(args):
             path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         if cli.exists() and cli.read_bytes() != (ROOT / 'khroxy').read_bytes():
             setup.atomic_text(cli.with_name('khroxy.previous'), cli.read_text(), 0o700)
+        for source in modules:
+            target = home / '.local/lib/khroxy/khroxy_lib' / source.name
+            target.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+            setup.atomic_text(target, source.read_bytes(), 0o600)
         setup.atomic_text(cli, (ROOT / 'khroxy').read_text(), 0o755)
         if not xray.exists():
             setup.atomic_text(xray, binary.read_bytes(), 0o700)
-        setup.atomic_text(state, json.dumps(saved, indent=2) + '\n')
+        if Store(state).exists:
+            Store(state).save(saved)
+        else:
+            setup.atomic_text(state, json.dumps(saved, indent=2) + '\n')
+            Store(state).migrate()
         setup.atomic_text(unit, proxy_unit, 0o644)
         setup.atomic_text(health_unit, health_contents, 0o644)
     finally:

@@ -11,6 +11,7 @@ No new tags have been created.
 ## Included source milestones
 
 - `c7dc4d4841b1838f3465e793fdfa6016ed6612fa`: Import normalized standalone baseline with original TUI and stabilized installer.
+- `4bc8b99256836c0ed6118f8fd9d59b7b29b95e99`: Add transactional SQLite storage and recoverable legacy migration.
 
 The initial snapshot includes earlier standalone stabilization work, with
 Windscribe experiments and internal review reports excluded. The portable

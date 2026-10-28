@@ -2,7 +2,7 @@
 
 khroxy gives each application a local HTTP proxy backed by a saved Xray profile. Its terminal interface has four screens: Profiles, Applications, Subscriptions, and Logs. You can use it directly on Linux or inside a separate AI container.
 
-The v0.1.0 development target is the standalone CLI and original four-screen TUI. XRAT is a functional reference only; XRAT, Windscribe and Mihomo are not dependencies. Experimental VPN work remains under `windscribe/` and is excluded from standalone release artifacts. Progress and release gates are tracked in [docs/TASKS.md](docs/TASKS.md). Container isolation still needs acceptance testing on the actual Debian host. A successful image build does not prove that its firewall works. Nothing in installation changes the host firewall or SSH.
+The v0.2.0.dev1 development target is the standalone CLI and original four-screen TUI. XRAT is a functional reference only; XRAT, Windscribe and Mihomo are not dependencies. Experimental VPN work remains under `windscribe/` and is excluded from standalone release artifacts. Progress and release gates are tracked in [docs/TASKS.md](docs/TASKS.md). Container isolation still needs acceptance testing on the actual Debian host. A successful image build does not prove that its firewall works. Nothing in installation changes the host firewall or SSH.
 
 ## Before you begin
 
@@ -57,6 +57,10 @@ khroxy run codex
 Profiles are not bundled. You need working credentials from your proxy provider. Do not paste them into public issues or command arguments. Native khroxy does not install Node.js or Codex; install the applications you intend to run separately.
 
 Open the TUI with `khroxy tui` (or `khroxy`). Use `1`–`4` or Tab/Shift+Tab to change screens, arrows or `j`/`k` to move, `?` for scrollable keyboard help, and `q` to quit. Existing navigation and actions remain available. In Profiles, Enter selects an active profile, `g` selects Fastest, `p` tests one profile, and `P` tests all manually. In Applications, `s` changes the assignment. Manual configuration changes can restart the proxy: finish important sessions first.
+
+## Data storage
+
+New installs use private local SQLite. Existing JSON remains readable; native upgrades migrate with an exact private backup. See [storage and migration](docs/STORAGE.md) before backup, restore or rollback.
 
 ## Automatic health checks and Fastest
 
@@ -113,7 +117,7 @@ Choose the engine, projects directory, and Caveman skill set. This mode stages a
 
 `--start` builds, then asks for explicit start confirmation. Repeated configuration preserves unknown settings. Existing containers are never automatically removed or replaced. `python3 setup.py` remains available for older workflows. `compose.yaml` is an advanced reference; use the unified installer for the supported workflow and its isolation gate.
 
-The image contains Node.js 24, npm, npx, Python, curl, Git, pinned Codex 0.164.0, khroxy, and the supplied Xray. Image dependencies are installed only during a build. The image tag is `localhost/khroxy-ai:0.1.0`; an existing running container retains its original image until you explicitly recreate it.
+The image contains Node.js 24, npm, npx, Python, curl, Git, pinned Codex 0.164.0, khroxy, and the supplied Xray. Image dependencies are installed only during a build. The image tag is `localhost/khroxy-ai:0.2.0.dev1`; an existing running container retains its original image until you explicitly recreate it.
 
 ### Build downloads
 
@@ -249,7 +253,7 @@ khroxy uninstall
 
 This stops/removes owned proxy, subscription-update, and health units, the CLI, and the owned Bash integration line. For deliberate configuration deletion, use `khroxy uninstall --purge` **instead**, before removing the CLI; it requires `PURGE KHROXY`. Unmanaged files remain. Xray is shared and retained. After reviewing them, remove `~/.local/bin/khroxy.previous` and, only if no other application needs it, `~/.local/bin/xray` manually. Shell PATH changes you made yourself remain yours to remove.
 
-For containers, finish sessions and run `./workspace.sh stop`, then `podman rm khroxy-ai` or `docker rm khroxy-ai`. This retains all projects, credentials, and profiles. Optionally remove the image with your engine's `image rm localhost/khroxy-ai:0.1.0`. Local `workspace-settings.json` and `docker/xray` may then be removed after review; deleting the checkout removes only installer sources/local staging, not external project directories or named volumes.
+For containers, finish sessions and run `./workspace.sh stop`, then `podman rm khroxy-ai` or `docker rm khroxy-ai`. This retains all projects, credentials, and profiles. Optionally remove the image with your engine's `image rm localhost/khroxy-ai:0.2.0.dev1`. Local `workspace-settings.json` and `docker/xray` may then be removed after review; deleting the checkout removes only installer sources/local staging, not external project directories or named volumes.
 
 To **deliberately erase** saved container authentication/settings, first back them up and verify the chosen engine and volume names. Only then run `podman volume rm khroxy_agent_home khroxy_config` or the Docker equivalent. These optional commands destroy persisted credentials/configuration; no installer or development test runs them. Uninstall does not remove Docker/Podman, Linux packages, unrelated system services, or host SSH/firewall settings.
 

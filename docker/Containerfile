@@ -34,6 +34,7 @@ RUN case "$CAVEMAN_SUITE" in none) ;; essentials|full) \
       && rm -rf /opt/caveman/.git ;; *) exit 1 ;; esac
 # Keep defaults explicit. The upstream installer is never executed; no hooks are added.
 ENV KHROXY_CAVEMAN_SUITE=${CAVEMAN_SUITE}
+COPY khroxy_lib /home/khroxy/.local/lib/khroxy/khroxy_lib
 COPY --chmod=0755 khroxy /home/khroxy/.local/bin/khroxy
 # Locally supplied, user-approved Xray binary (setup.py copies; intentionally gitignored).
 COPY --chmod=0755 docker/xray /home/khroxy/.local/bin/xray

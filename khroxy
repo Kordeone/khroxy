@@ -32,8 +32,15 @@ from datetime import datetime, timezone
 from urllib import error as urlerror, request as urlrequest
 import time
 import uuid
+from types import SimpleNamespace
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
+
+# Installed modules live beside the user CLI, not in user profile storage.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'lib' / 'khroxy'))
+from khroxy_lib import VERSION
+from khroxy_lib.storage import Store
+from khroxy_lib.cli import dispatch as extended_cli
 
 AUTOTIMER_UNIT = Path.home() / '.config' / 'systemd' / 'user' / 'khroxy-sub-update.timer'
 AUTOSERVICE_UNIT = Path.home() / '.config' / 'systemd' / 'user' / 'khroxy-sub-update.service'
@@ -317,6 +324,9 @@ def parse_share(link, allow_plaintext=False):
 
 
 def write_file(path, data, mode=0o600):
+    if path == STATE and Store(STATE).exists:
+        Store(STATE).save(json.loads(data))
+        return
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd, name = tempfile.mkstemp(prefix='.khroxy-', dir=str(path.parent))
     try:
@@ -338,9 +348,9 @@ def serial(obj):
 def load():
     ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(ROOT, 0o700)
-    if not STATE.exists():
+    if not STATE.exists() and not Store(STATE).exists:
         return {'version': 1, 'profiles': {}, 'apps': {}, 'subscriptions': {}}
-    data = json.loads(STATE.read_text())
+    data = Store(STATE).load() if Store(STATE).exists else json.loads(STATE.read_text())
     if data.get('version') != 1:
         fail('Unsupported state version')
     data.setdefault('subscriptions', {})
@@ -1493,7 +1503,8 @@ def cmd_update_feeds(name=None, due_only=False):
 
 # All uninstall paths are deliberately fixed, scoped to the current user.
 # Xray itself, codex-xray, foreign units and system settings are never owned.
-CLEANUP_FILES = ('state.json', 'runtime.json', '.lock', '.health-lock', 'events.log', 'routing.sock')
+CLEANUP_FILES = ('state.json', 'runtime.json', '.lock', '.health-lock', 'events.log', 'routing.sock', 'state.sqlite', 'state.sqlite-journal',
+                 'state.json.pre-sqlite', '.migration-lock')
 
 
 def cleanup_plan(purge=False):
@@ -2168,7 +2179,9 @@ def cmd_tui():
 def cli():
     if os.geteuid() == 0:
         fail('Do not run khroxy with sudo; it uses your per-user Xray service')
+    if extended_cli(SimpleNamespace(**globals()), sys.argv[1:]): return
     parser = argparse.ArgumentParser(description='Local per-app Xray manager; no root required')
+    parser.add_argument('--version', action='version', version='KHROXY ' + VERSION)
     sub = parser.add_subparsers(dest='verb')
     sub.add_parser('init')
     p = sub.add_parser('import', help='Paste a private share link securely')
@@ -2302,7 +2315,7 @@ def cli():
             if STATE.exists():
                 print('Already initialized:', STATE)
             else:
-                write_file(STATE, serial(state)); print('Created', STATE)
+                write_file(STATE, serial(state)); Store(STATE).migrate(); print('Created', STATE)
         elif args.verb == 'import': cmd_import(state, args.name, args.allow_plaintext)
         elif args.verb == 'sub-add':
             url = (getpass.getpass('HTTPS subscription URL (hidden): ') if sys.stdin.isatty()

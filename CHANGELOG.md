@@ -1,8 +1,8 @@
 # Changelog
 
-## 0.1.0 — local reconstructed candidate
+## 0.2.0.dev1 — local reconstructed candidate
 
-Import normalized standalone baseline with original TUI and stabilized installer.
+Add transactional SQLite storage and recoverable legacy migration.
 
 This is a present-day reconstruction, not an original release record.
 No version tag or public release is created by this reconstruction.
