@@ -1,8 +1,8 @@
 # Changelog
 
-## 0.2.0.dev8 — local reconstructed candidate
+## 0.2.0.dev9 — local reconstructed candidate
 
-Add loopback listeners, explicit routing and native static DNS.
+Add bounded resumable explicit-candidate TCP scanning.
 
 This is a present-day reconstruction, not an original release record.
 No version tag or public release is created by this reconstruction.

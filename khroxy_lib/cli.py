@@ -6,8 +6,12 @@ from .storage import Store
 
 
 def dispatch(app, argv):
-    if not argv or argv[0] not in ('storage', 'profile', 'import-data', 'engine', 'test-profiles', 'results', 'metadata', 'rotation', 'daemon', 'listener', 'route', 'dns'):
+    if not argv or argv[0] not in ('storage', 'profile', 'import-data', 'engine', 'test-profiles', 'results', 'metadata', 'rotation', 'daemon', 'listener', 'route', 'dns', 'scan'):
         return False
+    if argv[0] == 'scan':
+        from .scanning import cli
+        cli(app, argv[1:])
+        return True
     if argv[0] in ('listener','route','dns'):
         from .networking import cli
         cli(app, argv[0], argv[1:])
