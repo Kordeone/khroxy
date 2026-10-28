@@ -39,7 +39,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 # Installed modules live beside the user CLI, not in user profile storage.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'lib' / 'khroxy'))
 from khroxy_lib import VERSION
-from khroxy_lib import importing, engines, rotation, supervisor
+from khroxy_lib import importing, engines, rotation, supervisor, networking
 from khroxy_lib.storage import Store
 from khroxy_lib.cli import dispatch as extended_cli
 
@@ -588,7 +588,7 @@ def update_health(name, result, select_fastest=False, expected=None):
         if select_fastest:
             best = choose_best(new)
             if best is not None: new['fastest_profile'] = best
-            elif '@fastest' not in {a['profile'] for a in new['apps'].values()}:
+            elif '@fastest' not in {a['profile'] for a in new['apps'].values()} | set(networking.assignments(new)):
                 new['fastest_profile'] = None
         if (serial(build_runtime(new)) != serial(build_runtime(old))):
             commit(old, new)
@@ -660,12 +660,15 @@ def selected_engine(state=None):
 
 def build_runtime(state):
     name = state.get('engine', 'xray')
-    return engines.adapt(build_xray_runtime(state), name, state.get('engine_management',{}).get(name))
+    networking.validate(state)
+    config = networking.render(build_xray_runtime(state), state, resolve_profile)
+    return engines.adapt(config, name, state.get('engine_management',{}).get(name))
 
 
 def build_xray_runtime(state):
     apps = state['apps']
-    referenced = {resolve_profile(state, a['profile']) for a in apps.values()}
+    referenced = {resolve_profile(state, assignment) for assignment in
+                  [a['profile'] for a in apps.values()] + networking.assignments(state)}
     config = {'log': {'loglevel': 'warning'}, 'inbounds': [], 'outbounds': [],
               'routing': {'domainStrategy': 'AsIs', 'rules': []}}
     for name in sorted(referenced):
@@ -698,7 +701,7 @@ def build_xray_runtime(state):
         fastest_tags = {'app-' + name for name, app in apps.items() if app['profile'] == '@fastest'}
         if CONTAINER_MODE and state.get('selection_mode') == 'fastest':
             fastest_tags.add('gateway')
-        if fastest_tags:
+        if fastest_tags or '@fastest' in networking.assignments(state):
             selected = state.get('fastest_profile')
             if selected not in state['profiles']:
                 fail('Fastest profile missing; no direct fallback')
@@ -828,10 +831,10 @@ def start_status_monitor(interval=3):
     return cache, stop
 
 
-def listener_ready(port, tries=8):
+def listener_ready(port, tries=8, host='127.0.0.1'):
     for _ in range(tries):
         try:
-            with socket.create_connection(('127.0.0.1', port), timeout=1):
+            with socket.create_connection((host, port), timeout=1):
                 return True
         except OSError:
             time.sleep(1)
@@ -931,7 +934,7 @@ def cmd_app_add(state, name, profile, command):
         fail('Application command required')
     if shutil.which(argv[0]) is None:
         fail('Command not found: ' + argv[0])
-    ports = {item['port'] for item in state['apps'].values()}
+    ports = {item['port'] for item in state['apps'].values()} | {item['port'] for item in state.get('listeners', {}).values()}
     for port in range(PORT_START, PORT_END + 1):
         if port in ports:
             continue
@@ -1070,7 +1073,7 @@ def cmd_unit():
             fail('Container gateway did not start; no direct fallback')
         print('Container gateway active on port', GATEWAY_PORT)
         return
-    if (not STATE.exists() and not Store(STATE).exists) or not load()['apps']:
+    if (not STATE.exists() and not Store(STATE).exists) or not (load()['apps'] or load().get('listeners')):
         fail('Import a profile and add an application before installing the service')
     if UNIT.is_symlink() or (UNIT.exists() and (not UNIT.is_file() or not UNIT.read_text().startswith('# Managed by khroxy\n'))):
         fail(f'{UNIT} exists but is not managed by khroxy; refusing overwrite')
@@ -1096,6 +1099,9 @@ def cmd_unit():
     for name, app in load()['apps'].items():
         if not listener_ready(app['port']):
             fail('Service started but proxy listener not ready: ' + name)
+    for name, item in load().get('listeners', {}).items():
+        if not listener_ready(item['port'], host=item.get('listen','127.0.0.1')):
+            fail('Service started but additional listener not ready: ' + name)
     print('khroxy user service active (does not alter codex-xray).')
 
 

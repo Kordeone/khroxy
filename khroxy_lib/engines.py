@@ -161,20 +161,43 @@ def adapt(config, name, management=None):
         out['experimental']={'clash_api':{'external_controller':f"127.0.0.1:{management['port']}",
             'secret':management['secret'],'access_control_allow_origin':['http://127.0.0.1']}}
         selector=config['routing']['balancers'][0]['selector'][0]
-        out['outbounds'].append({'type':'selector','tag':'khroxy-fastest','outbounds':[n['tag'] for n in config['outbounds'] if n['protocol']!='blackhole'],
+        out['outbounds'].append({'type':'selector','tag':'khroxy-fastest','outbounds':[n['tag'] for n in config['outbounds'] if n['tag'].startswith('profile-')],
                                 'default':selector,'interrupt_exist_connections':False})
     for node in config['outbounds']:
         if node['protocol']=='blackhole': continue
         if node['protocol']=='freedom': out['outbounds'].append({'type':'direct','tag':node['tag']})
         else: out['outbounds'].append(sing_outbound(node))
+    blocked = {n['tag'] for n in config['outbounds'] if n['protocol']=='blackhole'}
     for inbound in config['inbounds']:
-        if inbound['protocol'] not in ('http','socks'): raise ValueError('Inbound unsupported by sing-box adapter')
-        out['inbounds'].append({'type':inbound['protocol'],'tag':inbound['tag'],'listen':inbound['listen'],'listen_port':inbound['port']})
+        kind=inbound['protocol']; settings=inbound.get('settings',{})
+        if kind not in ('http','socks','shadowsocks'): raise ValueError('Inbound unsupported by sing-box adapter')
+        node={'type':kind,'tag':inbound['tag'],'listen':inbound['listen'],'listen_port':inbound['port']}
+        if kind=='shadowsocks':
+            keys(settings,('method','password','network'),'Shadowsocks inbound')
+            node.update(method=settings['method'],password=settings['password'],network='tcp')
+        else:
+            keys(settings,('accounts','auth','udp'),'HTTP/SOCKS inbound')
+            if settings.get('accounts'):
+                node['users']=[{'username':u['user'],'password':u['pass']} for u in settings['accounts']]
+        out['inbounds'].append(node)
     for rule in config['routing']['rules']:
-        keys(rule,('type','inboundTag','outboundTag','balancerTag'),'routing')
+        keys(rule,('type','inboundTag','outboundTag','balancerTag','domain','ip','port','network'),'routing')
         target=rule.get('outboundTag',rule.get('balancerTag'))
-        out['route']['rules'].append(dict(inbound=rule['inboundTag'],**({'action':'reject'} if target=='khroxy-offline' else {'action':'route','outbound':target})))
+        node={'action':'reject'} if target in blocked else {'action':'route','outbound':target}
+        if rule.get('inboundTag'): node['inbound']=rule['inboundTag']
+        if rule.get('ip'): node['ip_cidr']=rule['ip']
+        if rule.get('port'): node['port']=[int(p) for p in rule['port'].split(',')]
+        if rule.get('network'): node['network']=rule['network'].split(',')
+        # Native sing-box combines domain and domain_suffix alternatives with OR.
+        for prefix,key in (('full:','domain'),('domain:','domain_suffix')):
+            values=[d[len(prefix):] for d in rule.get('domain',[]) if d.startswith(prefix)]
+            if values: node[key]=values
+        out['route']['rules'].append(node)
     out['route']['rules'].append({'action':'reject'})
+    if 'dns' in config:
+        out['dns']={'servers':[{'type':'hosts','tag':'khroxy-static','path':[],
+                              'predefined':config['dns']['hosts']}], 'final':'khroxy-static'}
+        out['route']['default_domain_resolver']='khroxy-static'
     return out
 
 

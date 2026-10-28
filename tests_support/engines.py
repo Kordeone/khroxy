@@ -1,6 +1,7 @@
 """Disposable process fixtures using explicitly supplied, trusted test engines."""
 from contextlib import contextmanager
 import os
+import json
 from pathlib import Path
 import socket
 import subprocess
@@ -20,12 +21,18 @@ def process(binary,name,path,env=None,port=None):
         child=subprocess.Popen(engines.command(binary,name,path),stdout=log,stderr=log,env=env,start_new_session=True)
         try:
             deadline=time.monotonic()+6
+            checks=[('127.0.0.1',port)] if port is not None else []
+            management=json.loads(Path(path).read_text()).get('experimental',{}).get('clash_api',{}).get('external_controller')
+            if management:
+                host,control_port=management.rsplit(':',1);checks.append((host,int(control_port)))
             while True:
                 if child.poll() is not None: raise AssertionError('Test engine exited: '+log_path.read_text())
-                if port is None:
+                if not checks:
                     time.sleep(.15); break
                 try:
-                    with socket.create_connection(('127.0.0.1',port),timeout=.1): break
+                    for address in checks:
+                        with socket.create_connection(address,timeout=.1):pass
+                    break
                 except OSError:
                     if time.monotonic()>deadline: raise AssertionError('Test engine did not listen: '+log_path.read_text())
                     time.sleep(.03)

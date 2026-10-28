@@ -40,6 +40,8 @@ def validate(state):
     options = state.get('profile_options',{})
     if not isinstance(options,dict) or any(not isinstance(v,dict) or type(v.get('enabled',True)) is not bool for v in options.values()):
         raise ValueError('Invalid profile options; source data retained')
+    from .networking import validate
+    validate(state)
     encode(state)
     return copy.deepcopy(state)
 
@@ -214,7 +216,8 @@ class Store:
             if record is None:
                 raise ValueError('Unknown profile')
             state = json.loads(db.execute('SELECT data FROM state WHERE id=1').fetchone()[0])
-            referenced = name in (state.get('active_profile'), state.get('fastest_profile')) or any(a.get('profile') == name for a in state.get('apps', {}).values())
+            from .networking import assignments
+            referenced = name in assignments(state) or name in (state.get('active_profile'), state.get('fastest_profile')) or any(a.get('profile') == name for a in state.get('apps', {}).values())
             if action in ('delete', 'purge') and referenced:
                 raise ValueError('Profile is assigned/selected; change assignments first')
             if action in ('enable', 'disable'):
