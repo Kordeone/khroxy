@@ -4,6 +4,7 @@ from contextlib import contextmanager
 import copy
 import fcntl
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -36,6 +37,9 @@ def validate(state):
                 not isinstance(app.get('command'), list) or not app['command'] or
                 not all(isinstance(part, str) for part in app['command'])):
             raise ValueError('Invalid application record; no changes made')
+    options = state.get('profile_options',{})
+    if not isinstance(options,dict) or any(not isinstance(v,dict) or type(v.get('enabled',True)) is not bool for v in options.values()):
+        raise ValueError('Invalid profile options; source data retained')
     encode(state)
     return copy.deepcopy(state)
 
@@ -116,7 +120,9 @@ class Store:
             if name not in current:
                 db.execute('UPDATE profiles SET deleted=1 WHERE name=?', (name,))
         for name, outbound in current.items():
-            db.execute('INSERT INTO profiles(name,data) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET data=excluded.data,deleted=0', (name, encode(outbound)))
+            options=state.get('profile_options',{}).get(name,{})
+            db.execute('INSERT INTO profiles(name,data,enabled,meta) VALUES(?,?,?,?) ON CONFLICT(name) DO UPDATE SET data=excluded.data,deleted=0',
+                       (name, encode(outbound), int(options.get('enabled',True)), encode({k:v for k,v in options.items() if k!='enabled'})))
         db.execute('DELETE FROM subscriptions')
         db.executemany('INSERT INTO subscriptions(name,data) VALUES(?,?)', [(n, encode(v)) for n,v in state.get('subscriptions', {}).items()])
 
@@ -166,7 +172,15 @@ class Store:
         finally:
             os.close(lock)
 
+    def check_legacy(self):
+        backup = self.legacy.with_name(self.legacy.name + '.pre-sqlite')
+        if self.legacy.is_symlink() or backup.is_symlink():
+            raise ValueError('Refusing symlink legacy state/backup')
+        if self.legacy.is_file() and backup.is_file() and self.legacy.read_bytes() != backup.read_bytes():
+            raise ValueError('Legacy JSON changed after migration; stop older writers and reconcile retained backups')
+
     def load(self):
+        self.check_legacy()
         with self.connection() as db:
             db.execute('BEGIN')
             row = db.execute('SELECT data FROM state WHERE id=1').fetchone()
@@ -174,18 +188,21 @@ class Store:
                 raise ValueError('Database state missing; restore a backup')
             state = json.loads(row[0])
             state['profiles'] = {}
+            had_options = 'profile_options' in state
             options = state.setdefault('profile_options', {})
             for name, raw, enabled, meta in db.execute('SELECT name,data,enabled,meta FROM profiles WHERE deleted=0 ORDER BY name'):
                 state['profiles'][name] = json.loads(raw)
                 if not enabled or meta != '{}':
-                    options[name] = dict(json.loads(meta), enabled=bool(enabled))
+                    options[name] = dict(options.get(name,{}), **json.loads(meta))
+                    options[name]['enabled'] = bool(enabled)
                 elif name in options:
                     options[name]['enabled'] = True
-            if not options:
+            if not options and not had_options:
                 state.pop('profile_options', None)
             return state
 
     def save(self, state):
+        self.check_legacy()
         with self.connection() as db:
             db.execute('BEGIN IMMEDIATE')
             self.save_in(db, state)
@@ -218,8 +235,11 @@ class Store:
     def append(self, table, profile, data, timestamp=None):
         if table not in HISTORY or (profile is not None and not NAME.fullmatch(profile)):
             raise ValueError('Invalid history record')
+        timestamp = time.time() if timestamp is None else timestamp
+        if not isinstance(timestamp,(int,float)) or not math.isfinite(timestamp) or timestamp<0:
+            raise ValueError('Invalid history timestamp')
         with self.connection() as db:
-            db.execute(f'INSERT INTO {table}(profile,timestamp,data) VALUES(?,?,?)', (profile, time.time() if timestamp is None else timestamp, encode(data)))
+            db.execute(f'INSERT INTO {table}(profile,timestamp,data) VALUES(?,?,?)', (profile, timestamp, encode(data)))
 
     def history(self, table, profile=None, limit=100, offset=0):
         if table not in HISTORY or not 1 <= limit <= 1000 or offset < 0:
@@ -283,3 +303,21 @@ class Store:
             db.executemany('INSERT INTO profiles(name,data,enabled,deleted,meta) VALUES(?,?,?,?,?)', profiles)
             for table in HISTORY:
                 db.executemany(f'INSERT INTO {table}(profile,timestamp,data) VALUES(?,?,?)', payload['history'][table])
+
+    def update_metadata(self, name, values):
+        with self.connection() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row=db.execute('SELECT meta FROM profiles WHERE name=? AND deleted=0',(name,)).fetchone()
+            if row is None: raise ValueError('Unknown profile')
+            metadata=json.loads(row[0]);metadata.update(values)
+            db.execute('UPDATE profiles SET meta=? WHERE name=?',(encode(metadata),name))
+
+    def prune(self, before, keep):
+        if not isinstance(before,(int,float)) or not math.isfinite(before) or before<0 or not 1<=keep<=100000:
+            raise ValueError('Invalid retention limits')
+        counts={}
+        with self.connection() as db:
+            db.execute('BEGIN IMMEDIATE')
+            for table in HISTORY:
+                counts[table]=db.execute(f'DELETE FROM {table} WHERE timestamp<? OR id NOT IN (SELECT id FROM {table} ORDER BY id DESC LIMIT ?)',(before,keep)).rowcount
+        return counts

@@ -384,6 +384,7 @@ def probe_profile(outbound):
 
     No running app or installed user service required. Failures are redacted.
     """
+    failure = 'engine-or-configuration'
     try:
         with temporary_profile_proxy(outbound) as url:
             result = subprocess.run(['curl', '--noproxy', '', '--proxy', url,
@@ -394,9 +395,12 @@ def probe_profile(outbound):
             if result.returncode == 0 and len(parts) == 2 and parts[0] == '204':
                 return {'ok': True, 'ms': round(float(parts[1]) * 1000),
                         'time': int(time.time())}
-    except (OSError, ValueError, subprocess.TimeoutExpired):
+            failure = {6:'dns',7:'connection-refused',28:'timeout',35:'tls',60:'tls'}.get(result.returncode,'http-status' if result.returncode==0 else 'network')
+    except subprocess.TimeoutExpired:
+        failure = 'timeout'
+    except (OSError, ValueError):
         pass
-    return {'ok': False, 'ms': None, 'time': int(time.time())}
+    return {'ok': False, 'ms': None, 'time': int(time.time()), 'category': failure}
 
 def choose_best(state, max_age=900):
     now = int(time.time())
@@ -457,6 +461,8 @@ def background_health():
                 # A profile edited/deleted during a probe must not inherit its result.
                 if old['profiles'].get(name) == snapshot['profiles'][name]:
                     new.setdefault('health', {})[name] = result
+                    if Store(STATE).exists:
+                        Store(STATE).append('measurements', name, dict(result, configuration_hash=importing.fingerprint(old['profiles'][name])), result.get('time',time.time()))
                     log_event('probe_ok' if result['ok'] else 'probe_fail', name)
             best = choose_stable_best(new)
             new['health_checked_at'] = int(time.time())
@@ -546,13 +552,15 @@ def switch_fastest_live(old, proposed):
         log_event('health_api_fail', detail='unavailable')
         return False
 
-def update_health(name, result, select_fastest=False):
+def update_health(name, result, select_fastest=False, expected=None):
     fd = lock()
     try:
         old = load()
-        if name not in old['profiles']: return
+        if name not in old['profiles'] or (expected is not None and old['profiles'][name] != expected): return
         new = copy.deepcopy(old)
         new.setdefault('health', {})[name] = result
+        if Store(STATE).exists:
+            Store(STATE).append('measurements', name, dict(result, configuration_hash=importing.fingerprint(old['profiles'][name])), result.get('time',time.time()))
         if select_fastest:
             best = choose_best(new)
             if best is not None: new['fastest_profile'] = best
@@ -600,7 +608,7 @@ def test_profiles(names, select_fastest=False):
         if name not in snapshot['profiles']: fail('Unknown profile: ' + name)
         log_event('probe_start', name)
         result = probe_profile(snapshot['profiles'][name])
-        update_health(name, result, select_fastest=False)
+        update_health(name, result, select_fastest=False, expected=snapshot['profiles'][name])
         log_event('probe_ok' if result['ok'] else 'probe_fail', name,
                   'connected' if result['ok'] else 'unavailable')
         print(name, f"{result['ms']} ms" if result['ok'] else 'FAIL')
@@ -1015,7 +1023,7 @@ def cmd_unit():
             fail('Container gateway did not start; no direct fallback')
         print('Container gateway active on port', GATEWAY_PORT)
         return
-    if not STATE.exists() or not load()['apps']:
+    if (not STATE.exists() and not Store(STATE).exists) or not load()['apps']:
         fail('Import a profile and add an application before installing the service')
     if UNIT.exists() and 'Managed by khroxy' not in UNIT.read_text():
         fail(f'{UNIT} exists but is not managed by khroxy; refusing overwrite')

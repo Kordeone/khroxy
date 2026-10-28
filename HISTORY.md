@@ -15,6 +15,7 @@ No new tags have been created.
 - `0bc434b22e927580c93ffbf8bb6558e6f996b6d5`: Expand bounded imports with deduplication and shared source ownership.
 - `5e35a16e66e8259c7646bf6b393498f477255ea8`: Support optional Xray, V2Ray and sing-box engines.
 - `bed300e2f25d7b0db8a2c9e384847e2d4ded2049`: Add bounded concurrent proxy probes and owned-process cancellation.
+- `1aeed9c79f242df87083c3d9141c8fdf33056ac3`: Persist diagnostics and rank fresh measurements with offline metadata.
 
 The initial snapshot includes earlier standalone stabilization work, with
 Windscribe experiments and internal review reports excluded. The portable

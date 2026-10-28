@@ -142,6 +142,8 @@ class RealProbeTests(unittest.TestCase):
         config=self.root/'.config/khroxy';config.mkdir(parents=True)
         state=dict(self.state,version=1,profiles={'fixture':DIRECT},engine_binaries={'xray':str(paths()['xray'])})
         raw=json.dumps(state).encode();(config/'state.json').write_bytes(raw)
+        from khroxy_lib.storage import Store
+        Store(config/'state.json').migrate()
         runtime=config/'runtime.json';runtime.write_bytes(b'active-fixture-runtime')
         env=dict(os.environ,HOME=str(self.root),PYTHONDONTWRITEBYTECODE='1')
         child=subprocess.Popen([str(ROOT/'khroxy'),'test-profiles','--url',f'http://127.0.0.1:{self.origin.server_address[1]}/slow','--timeout','20'],

@@ -294,6 +294,9 @@ def cli(app,argv):
     parser.add_argument('--retries',type=int,default=0);parser.add_argument('--max-bytes',type=int,default=262144)
     parser.add_argument('--url');parser.add_argument('--ca-file')
     args=parser.parse_args(argv);state=app.load();profiles={}
+    from .storage import Store
+    if not Store(app.STATE).exists:
+        raise ValueError('Run khroxy storage migrate before persistent testing; stop older KHROXY writers first')
     for name in args.names or sorted(state['profiles']):
         app.check_name(name)
         if name not in state['profiles']: raise ValueError('Unknown profile')
@@ -301,6 +304,9 @@ def cli(app,argv):
     cancel=threading.Event();previous=signal.signal(signal.SIGINT,lambda *args:cancel.set())
     try:
         runner=Runner(app,state,args.stages.split(','),args.concurrency,args.timeout,args.retries,args.max_bytes,args.url,args.ca_file,cancel)
-        results=runner.run(profiles);print(json.dumps(results))
+        results=runner.run(profiles)
+        from .diagnostics import record
+        record(app,state,results)
+        print(json.dumps(results))
         if cancel.is_set(): raise SystemExit(130)
     finally: signal.signal(signal.SIGINT,previous)

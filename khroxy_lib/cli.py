@@ -6,8 +6,12 @@ from .storage import Store
 
 
 def dispatch(app, argv):
-    if not argv or argv[0] not in ('storage', 'profile', 'import-data', 'engine', 'test-profiles'):
+    if not argv or argv[0] not in ('storage', 'profile', 'import-data', 'engine', 'test-profiles', 'results', 'metadata'):
         return False
+    if argv[0] in ('results','metadata'):
+        from .diagnostics import cli
+        cli(app, argv[0], argv[1:])
+        return True
     if argv[0] == 'test-profiles':
         from .testing import cli
         cli(app, argv[1:])
@@ -46,7 +50,7 @@ def dispatch(app, argv):
         p = verbs.add_parser('backup', help='Write a private backup containing credentials; never publish it')
         p.add_argument('path')
         p = verbs.add_parser('restore'); p.add_argument('path')
-        p = verbs.add_parser('history'); p.add_argument('--profile'); p.add_argument('--limit', type=int, default=100)
+        p = verbs.add_parser('history'); p.add_argument('--profile'); p.add_argument('--limit', type=int, default=100); p.add_argument('--offset', type=int, default=0)
     else:
         for action in ('enable','disable','delete','restore','purge'):
             p = verbs.add_parser(action); p.add_argument('name')
@@ -74,7 +78,7 @@ def dispatch(app, argv):
             store.restore(args.path)
             print(json.dumps({'restored':True,'pre_restore_backup':True}))
         elif args.action == 'history':
-            print(json.dumps(store.history('measurements', args.profile, args.limit)))
+            print(json.dumps(store.history('measurements', args.profile, args.limit, args.offset)))
     finally:
         app.os.close(fd)
     return True
