@@ -39,6 +39,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 # Installed modules live beside the user CLI, not in user profile storage.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'lib' / 'khroxy'))
 from khroxy_lib import VERSION
+from khroxy_lib import importing
 from khroxy_lib.storage import Store
 from khroxy_lib.cli import dispatch as extended_cli
 
@@ -235,6 +236,8 @@ def parse_share(link, allow_plaintext=False):
     if not link or '\n' in link or '\r' in link or len(link) > 16000:
         fail('Expected one share link (max 16 KB)')
     scheme = link.split('://', 1)[0].lower()
+    if scheme in ('http','https','socks','socks5','hy2','hysteria2'):
+        return importing.share(link, allow_plaintext)
     if scheme not in {'vless', 'vmess', 'trojan', 'ss'}:
         fail('Supported formats: vless://, vmess://, trojan://, ss://')
 
@@ -852,6 +855,10 @@ def cmd_import(state, name, allow_plaintext=False):
     link = (getpass.getpass('Paste share link (hidden): ') if sys.stdin.isatty()
             else sys.stdin.readline().strip())
     outbound = parse_share(link, allow_plaintext)
+    existing = next((key for key,value in state['profiles'].items() if importing.fingerprint(value) == importing.fingerprint(outbound)), None)
+    if existing:
+        print('Profile already imported as', existing, '; no duplicate added')
+        return
     proposed = copy.deepcopy(state)
     proposed['profiles'][name] = outbound
     # Import does not change any running listener or profile selection.
@@ -1135,7 +1142,9 @@ def parse_subscription(data, allow_plaintext=False, skip_unsupported=False, skip
         fail('Subscription is not UTF-8')
     if not text:
         fail('Empty subscription')
-    if not any(x in text.lower() for x in ('vless://', 'vmess://', 'trojan://', 'ss://')):
+    if text.startswith(('{','[')):
+        return importing.json_nodes(text, allow_plaintext)
+    if not any(x in text.lower() for x in ('vless://', 'vmess://', 'trojan://', 'ss://','http://','https://','socks://','socks5://','hy2://','hysteria2://')):
         try:
             # Strictly parse standard/URL-safe base64, ignoring whitespace.
             enc = ''.join(text.split())
@@ -1146,6 +1155,8 @@ def parse_subscription(data, allow_plaintext=False, skip_unsupported=False, skip
             fail('Unsupported subscription body (expected share links or base64 list)')
     if len(text) > MAX_SUB_BYTES:
         fail('Decoded subscription too large')
+    if text.startswith(('{','[')):
+        return importing.json_nodes(text, allow_plaintext)
     lines = [x.strip() for x in text.splitlines() if x.strip() and not x.lstrip().startswith('#')]
     if not 1 <= len(lines) <= MAX_SUB_PROFILES:
         fail('Subscription must contain 1–100 share links')
@@ -1315,11 +1326,13 @@ def update_feed(state, name, now=None):
         log_event('parse_skip', name, 'skipped')
     log_event('fetch_parse', name, 'parsed')
     profiles = make_sub_profiles(name, parsed)
+    canonical = {importing.fingerprint(out):key for key,out in state['profiles'].items()}
+    profiles = {canonical.get(importing.fingerprint(out),key):out for key,out in profiles.items()}
     proposed = copy.deepcopy(state)
     old_owned = set(entry.get('profiles', []))
     # Never overwrite manual profiles or profiles managed by other sources.
     foreign = (set(profiles) & set(state['profiles'])) - old_owned
-    if foreign:
+    if any(state['profiles'][key] != profiles[key] and importing.fingerprint(state['profiles'][key]) != importing.fingerprint(profiles[key]) for key in foreign):
         fail('Subscription profile-name collision; previous data retained')
     updated = proposed['subscriptions'][name]
     used = {resolve_profile(state, app['profile']) for app in state['apps'].values()}
@@ -1331,8 +1344,13 @@ def update_feed(state, name, now=None):
     # subscription nodes on partial imports, not only application assignments.
     stale = ((old_owned - set(profiles)) if skipped else
              (old_owned - set(profiles)) & used)
-    for profile in old_owned - set(profiles) - stale:
+    shared = set().union(*(set(sub.get('profiles',[])) for key,sub in state['subscriptions'].items() if key != name))
+    shared.update(state.get('manual_profiles',[]))
+    for profile in old_owned - set(profiles) - stale - shared:
         proposed['profiles'].pop(profile, None)
+    existing_owned = set().union(*(set(sub.get('profiles',[])) for sub in state['subscriptions'].values()))
+    reused_manual = set(profiles) & (set(state['profiles']) - existing_owned)
+    proposed['manual_profiles'] = sorted(set(state.get('manual_profiles',[])) | reused_manual)
     proposed['profiles'].update(profiles)
     # Preserve a retained assigned profile's ownership for later cleanup.
     updated['profiles'] = sorted(set(profiles) | stale)
@@ -1383,6 +1401,8 @@ def remove_feed(state, name):
     used.update(n for n in (state.get('active_profile'), state.get('fastest_profile')) if n)
     used.update(sub.get('via') for sub in proposed['subscriptions'].values()
                 if sub.get('mode') == 'profile')
+    used.update(state.get('manual_profiles', []))
+    used.update(set().union(*(set(sub.get('profiles', [])) for sub in proposed['subscriptions'].values())))
     for profile in entry['profiles']:
         if profile not in used:
             proposed['profiles'].pop(profile, None)

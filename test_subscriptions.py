@@ -61,7 +61,7 @@ class SubscriptionTests(unittest.TestCase):
 
     def test_reject_unsupported_and_invalid_instead_of_partial_import(self):
         with self.assertRaisesRegex(ValueError, 'link #2'):
-            p.parse_subscription((link1+'\nhysteria2://secret@example.org:443').encode())
+            p.parse_subscription((link1+'\nunsupported://fixture@example.org:443').encode())
         with self.assertRaisesRegex(ValueError, 'Empty'):
             p.parse_subscription(b'  ')
         with self.assertRaises(ValueError):

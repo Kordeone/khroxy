@@ -6,9 +6,31 @@ from .storage import Store
 
 
 def dispatch(app, argv):
-    if not argv or argv[0] not in ('storage', 'profile'):
+    if not argv or argv[0] not in ('storage', 'profile', 'import-data'):
         return False
     parser = argparse.ArgumentParser(prog='khroxy ' + argv[0])
+    if argv[0] == 'import-data':
+        parser.add_argument('--file')
+        parser.add_argument('--source', default='local')
+        parser.add_argument('--allow-plaintext', action='store_true')
+        args = parser.parse_args(argv[1:])
+        app.check_name(args.source)
+        if args.file:
+            path = app.Path(args.file)
+            if path.is_symlink() or not path.is_file() or path.stat().st_size > app.MAX_SUB_BYTES:
+                raise ValueError('Unsafe or oversized import file')
+            with path.open('rb') as stream: raw = stream.read(app.MAX_SUB_BYTES + 1)
+        else:
+            raw = app.sys.stdin.buffer.read(app.MAX_SUB_BYTES + 1)
+        nodes = app.parse_subscription(raw, args.allow_plaintext)
+        fd = app.lock()
+        try:
+            state, summary = app.importing.merge(app.load(), nodes, args.source)
+            app.write_file(app.STATE, app.serial(state))
+        finally:
+            app.os.close(fd)
+        print(json.dumps(summary))
+        return True
     verbs = parser.add_subparsers(dest='action', required=True)
     if argv[0] == 'storage':
         verbs.add_parser('status')
