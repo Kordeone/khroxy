@@ -17,7 +17,13 @@ ROOT = Path(__file__).resolve().parent
 
 
 def systemd_arg(path):
-    return '"' + str(path).replace('\\', '\\\\').replace('"', '\\"').replace('%', '%%') + '"'
+    return '"' + str(path).replace('\\', '\\\\').replace('"', '\\"').replace('%', '%%').replace('$', '$$') + '"'
+
+
+def systemd_condition(path):
+    value = str(path)
+    if any(ord(c) < 32 for c in value): raise setup.SetupError('Invalid control character in service path')
+    return value.replace('%', '%%')
 
 
 def safe_path(path, home):
@@ -73,7 +79,7 @@ def native_install(args):
     if saved.get('version') != 1:
         raise setup.SetupError('Unsupported state version; no files changed')
     proxy_unit = ('# Managed by khroxy\n[Unit]\nDescription=khroxy private per-app Xray proxy\n'
-                  f'ConditionPathExists={systemd_arg(runtime)}\nAfter=network-online.target\n\n'
+                  f'ConditionPathExists={systemd_condition(runtime)}\nConditionPathExists=!{systemd_condition(state.parent / ".supervisor-mode")}\nAfter=network-online.target\n\n'
                   '[Service]\nType=simple\n'
                   'ExecStart=' + ' '.join(systemd_arg(arg) for arg in engines.command(xray,engine,runtime)) + '\n'
                   'Restart=on-failure\nRestartSec=3\nNoNewPrivileges=true\nUMask=0077\n\n'

@@ -39,7 +39,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 # Installed modules live beside the user CLI, not in user profile storage.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'lib' / 'khroxy'))
 from khroxy_lib import VERSION
-from khroxy_lib import importing, engines, rotation
+from khroxy_lib import importing, engines, rotation, supervisor
 from khroxy_lib.storage import Store
 from khroxy_lib.cli import dispatch as extended_cli
 
@@ -55,6 +55,7 @@ SERVICE = 'khroxy.service'
 CONTAINER_MODE = os.environ.get('KHROXY_CONTAINER') == '1'
 GATEWAY_PORT = 20819
 CONTAINER_PID = ROOT / 'xray.pid'
+_CONTAINER_CHILDREN = {}
 PORT_START, PORT_END = 20820, 20999
 NAME = re.compile(r'^[a-z][a-z0-9_-]{0,30}$')
 # NO_PROXY is inconsistently interpreted for CIDRs; keep explicit local hostnames.
@@ -729,21 +730,18 @@ def xray_test(payload):
 def _container_owned_pid():
     if not CONTAINER_PID.is_file() or CONTAINER_PID.is_symlink(): return None
     try:
-        pid = int(CONTAINER_PID.read_text().strip())
-        if pid <= 1: return None
-        cmd = Path(f'/proc/{pid}/cmdline').read_bytes().replace(b'\x00', b' ').decode(errors='replace')
-        uid_line = next(x for x in Path(f'/proc/{pid}/status').read_text().splitlines()
-                        if x.startswith('Uid:'))
-        if (str(selected_engine()[1]) in cmd and str(RUNTIME) in cmd and
-                int(uid_line.split()[1]) == os.geteuid()):
-            return pid
-    except (OSError, ValueError, StopIteration):
-        pass
-    return None
+        # Legacy integer PID records lack a start time/boot/nonce proof. They
+        # remain recoverable, but never authorize signalling an arbitrary PID.
+        record = supervisor.read(ROOT, CONTAINER_PID.name)
+        return record['pid'] if supervisor.owned(record) else None
+    except (OSError, ValueError, KeyError):
+        return None
 
 
 def _container_ctl(*args):
     """Minimal container-mode process control; does not invoke systemd."""
+    for pid, child in list(_CONTAINER_CHILDREN.items()):
+        if child.poll() is not None: _CONTAINER_CHILDREN.pop(pid, None)
     done = lambda rc=0, err='': subprocess.CompletedProcess(['container', *args], rc, '', err)
     op = args[0] if args else None
     if op == 'daemon-reload': return done()
@@ -751,8 +749,10 @@ def _container_ctl(*args):
     if op in ('restart', 'stop', 'disable', 'enable'):
         old = _container_owned_pid()
         if old and op in ('restart', 'stop', 'disable'):
-            try: os.kill(old, signal.SIGTERM)
-            except ProcessLookupError: pass
+            record = supervisor.read(ROOT, CONTAINER_PID.name)
+            supervisor.stop_owned(record)
+            child = _CONTAINER_CHILDREN.pop(old, None)
+            if child is not None: child.wait(timeout=2)
             for _ in range(35):
                 if not _container_owned_pid(): break
                 time.sleep(.1)
@@ -761,26 +761,44 @@ def _container_ctl(*args):
         if op in ('stop', 'disable'): return done()
         if op == 'enable' and old: return done()
         if not RUNTIME.is_file(): return done(1, 'No generated Xray runtime')
+        proc = None
+        previous_pid = CONTAINER_PID.read_bytes() if CONTAINER_PID.is_file() and not CONTAINER_PID.is_symlink() else None
         try:
             config = json.loads(RUNTIME.read_text())
             if not config.get('inbounds'): return done(1, 'No configured proxy listener')
             # Use a detached process; no root-capable Xray in this mode.
+            token = __import__('secrets').token_hex(32)
             proc = subprocess.Popen(engines.command(selected_engine()[1], selected_engine()[0], RUNTIME),
+                                    env=dict(os.environ, KHROXY_ENGINE_OWNER=token),
                                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                     stderr=subprocess.DEVNULL, start_new_session=True)
-            write_file(CONTAINER_PID, (str(proc.pid) + '\n').encode())
+            record = dict(supervisor.identity(proc.pid), token=token)
+            supervisor.write(ROOT, CONTAINER_PID.name, record)
             time.sleep(.2)
-            if proc.poll() is not None: return done(1, 'Xray exited during startup')
+            if proc.poll() is not None:
+                if previous_pid is None: CONTAINER_PID.unlink(missing_ok=True)
+                else: write_file(CONTAINER_PID, previous_pid)
+                return done(1, 'Xray exited during startup')
+            _CONTAINER_CHILDREN[proc.pid] = proc
             return done()
         except (OSError, ValueError) as exc:
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+                try: proc.wait(timeout=2)
+                except subprocess.TimeoutExpired: proc.kill(); proc.wait(timeout=2)
             return done(1, type(exc).__name__)
     return done(1, 'Unsupported container service operation')
 
 
 def systemctl(*args, timeout=15):
     """User systemd calls must never wait forever on a stuck session bus."""
+    if SERVICE in args and supervisor.enabled(ROOT):
+        return supervisor.control(SimpleNamespace(**globals()), args, timeout)
     if CONTAINER_MODE:
         return _container_ctl(*args)
+    if args and args[0] in ('start', 'restart', 'stop', 'enable', 'disable') and SERVICE in args:
+        if UNIT.is_symlink() or not UNIT.is_file() or not UNIT.read_text().startswith('# Managed by khroxy\n'):
+            return subprocess.CompletedProcess(['systemctl', '--user', *args], 1, '', 'Refusing unmanaged khroxy user unit')
     try:
         return subprocess.run(['systemctl', '--user', *args],
                               capture_output=True, text=True, timeout=timeout)
@@ -1032,6 +1050,13 @@ def systemd_word(value):
 
 
 def cmd_unit():
+    if supervisor.enabled(ROOT):
+        payload = serial(build_runtime(load()))
+        xray_test(payload)
+        write_file(RUNTIME, payload)
+        supervisor.rpc(ROOT, 'start', timeout=35)
+        print('Owned proxy active under KHROXY supervisor')
+        return
     if CONTAINER_MODE:
         st = load()
         selected = st.get('fastest_profile') if st.get('selection_mode') == 'fastest' else st.get('active_profile')
@@ -1047,13 +1072,14 @@ def cmd_unit():
         return
     if (not STATE.exists() and not Store(STATE).exists) or not load()['apps']:
         fail('Import a profile and add an application before installing the service')
-    if UNIT.exists() and 'Managed by khroxy' not in UNIT.read_text():
+    if UNIT.is_symlink() or (UNIT.exists() and (not UNIT.is_file() or not UNIT.read_text().startswith('# Managed by khroxy\n'))):
         fail(f'{UNIT} exists but is not managed by khroxy; refusing overwrite')
     # ensure valid current runtime before installing
     xray_test(RUNTIME.read_bytes())
     UNIT.parent.mkdir(parents=True, exist_ok=True)
     contents = ('# Managed by khroxy\n'
                 '[Unit]\nDescription=khroxy private per-app Xray proxy\n'
+                'ConditionPathExists=!' + str(ROOT / supervisor.MODE).replace('%', '%%') + '\n'
                 'After=network-online.target\nWants=network-online.target\n\n'
                 '[Service]\nType=simple\n'
                 'ExecStart=' + ' '.join(systemd_word(v) for v in engines.command(selected_engine()[1], selected_engine()[0], RUNTIME)) + '\n'
@@ -1577,7 +1603,8 @@ def cmd_update_feeds(name=None, due_only=False):
 # All uninstall paths are deliberately fixed, scoped to the current user.
 # Xray itself, codex-xray, foreign units and system settings are never owned.
 CLEANUP_FILES = ('state.json', 'runtime.json', '.lock', '.health-lock', 'events.log', 'routing.sock', 'state.sqlite', 'state.sqlite-journal',
-                 'state.json.pre-sqlite', '.migration-lock')
+                 'state.json.pre-sqlite', '.migration-lock', '.supervisor-mode', '.daemon-lock',
+                 'daemon-owner.json', 'runtime-session.json', 'supervisor.sock', 'xray.pid')
 
 
 def cleanup_plan(purge=False):
@@ -1586,6 +1613,7 @@ def cleanup_plan(purge=False):
         'auto_service': str(AUTOSERVICE_UNIT),
         'auto_timer': str(AUTOTIMER_UNIT),
         'health_service': str(UNIT.with_name('khroxy-health.service')),
+        'supervisor_service': str(UNIT.with_name('khroxy-supervisor.service')),
         'cli': str(Path.home() / '.local' / 'bin' / 'khroxy'),
         'bashrc_hook': str(bashrc_path()),
         'config': [str(ROOT / filename) for filename in CLEANUP_FILES] if purge else [],
@@ -1597,7 +1625,8 @@ def cleanup_precheck(purge=False):
         fail('Refusing symlink ~/.bashrc; remove owned shell hook manually before uninstall')
     binary = Path.home() / '.local' / 'bin' / 'khroxy'
     health_unit = UNIT.with_name('khroxy-health.service')
-    for path in [UNIT, health_unit, AUTOSERVICE_UNIT, AUTOTIMER_UNIT, binary, ROOT, *(ROOT / x for x in CLEANUP_FILES)]:
+    supervisor_unit = UNIT.with_name('khroxy-supervisor.service')
+    for path in [UNIT, health_unit, supervisor_unit, AUTOSERVICE_UNIT, AUTOTIMER_UNIT, binary, ROOT, *(ROOT / x for x in CLEANUP_FILES)]:
         if path.is_symlink():
             fail(f'Refusing symlink during uninstall: {path}')
     for path in (AUTOSERVICE_UNIT, AUTOTIMER_UNIT):
@@ -1605,6 +1634,8 @@ def cleanup_precheck(purge=False):
             fail(f'Unknown subscription timer unit: {path}')
     if health_unit.exists() and (not health_unit.is_file() or not health_unit.read_text().startswith('# Managed by khroxy\n')):
         fail('Unknown health service unit; refusing uninstall')
+    if supervisor_unit.exists() and (not supervisor_unit.is_file() or not supervisor_unit.read_text().startswith('# Managed by khroxy\n')):
+        fail('Unknown supervisor service unit; refusing uninstall')
     if UNIT.exists() and not UNIT.is_file():
         fail('Unrecognized user unit type; refusing uninstall')
     if UNIT.exists() and not UNIT.read_text().startswith('# Managed by khroxy\n'):
@@ -1617,7 +1648,7 @@ def cleanup_precheck(purge=False):
     if purge:
         for name in CLEANUP_FILES:
             target = ROOT / name
-            managed_socket = name == 'routing.sock' and target.exists() and stat.S_ISSOCK(target.stat().st_mode)
+            managed_socket = name in ('routing.sock', 'supervisor.sock') and target.exists() and stat.S_ISSOCK(target.stat().st_mode)
             if target.exists() and not target.is_file() and not managed_socket:
                 fail(f'Unexpected managed file type: {target}')
     return binary
@@ -1648,6 +1679,22 @@ def cmd_uninstall(purge=False, dry_run=False, confirmation=None):
             confirmation = input('Type PURGE KHROXY to confirm: ')
         if confirmation != 'PURGE KHROXY':
             fail('Purge confirmation not matched; nothing changed')
+    supervisor_unit = UNIT.with_name('khroxy-supervisor.service')
+    if supervisor_unit.exists():
+        stopped = systemctl('disable', '--now', 'khroxy-supervisor.service')
+        if stopped.returncode: fail('Could not stop owned supervisor unit; refusing uninstall')
+        supervisor_unit.unlink()
+        systemctl('daemon-reload')
+    if supervisor.enabled(ROOT):
+        try: supervisor.rpc(ROOT, 'shutdown', timeout=5)
+        except (FileNotFoundError, ConnectionRefusedError):
+            supervisor.stop_owned(supervisor.read(ROOT, supervisor.SESSION))
+        deadline = time.monotonic() + 5
+        while ((ROOT / supervisor.SOCKET).exists() or supervisor.owned(supervisor.read(ROOT, supervisor.SESSION))) and time.monotonic() < deadline:
+            time.sleep(.03)
+        if (ROOT / supervisor.SOCKET).exists() or supervisor.owned(supervisor.read(ROOT, supervisor.SESSION)):
+            fail('Supervisor still active; refusing uninstall')
+        (ROOT / supervisor.MODE).unlink(missing_ok=True)
     health_unit = UNIT.with_name('khroxy-health.service')
     if health_unit.exists():
         result = systemctl('disable', '--now', 'khroxy-health.service')

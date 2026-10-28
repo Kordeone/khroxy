@@ -6,8 +6,12 @@ from .storage import Store
 
 
 def dispatch(app, argv):
-    if not argv or argv[0] not in ('storage', 'profile', 'import-data', 'engine', 'test-profiles', 'results', 'metadata', 'rotation'):
+    if not argv or argv[0] not in ('storage', 'profile', 'import-data', 'engine', 'test-profiles', 'results', 'metadata', 'rotation', 'daemon'):
         return False
+    if argv[0] == 'daemon':
+        from .supervisor import cli
+        cli(app, argv[1:])
+        return True
     if argv[0] == 'rotation':
         from .rotation import cli
         cli(app, argv[1:])
