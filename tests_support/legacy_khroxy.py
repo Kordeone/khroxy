@@ -1,0 +1,2149 @@
+#!/usr/bin/env python3
+"""khroxy: local-only, per-application Xray profile manager (v0.8).
+
+No system-wide routing, firewall, NetworkManager, or existing codex-xray edits.
+"""
+import argparse
+import base64
+import copy
+import hashlib
+import curses
+import fcntl
+import io
+import getpass
+from contextlib import redirect_stdout, redirect_stderr
+import ipaddress
+import json
+import os
+import re
+import shlex
+import ssl
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import queue
+import signal
+import stat
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from urllib import error as urlerror, request as urlrequest
+import time
+import uuid
+from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlsplit
+
+AUTOTIMER_UNIT = Path.home() / '.config' / 'systemd' / 'user' / 'khroxy-sub-update.timer'
+AUTOSERVICE_UNIT = Path.home() / '.config' / 'systemd' / 'user' / 'khroxy-sub-update.service'
+ROOT = Path.home() / '.config' / 'khroxy'
+STATE = ROOT / 'state.json'
+RUNTIME = ROOT / 'runtime.json'
+EVENTS = ROOT / 'events.log'
+UNIT = Path.home() / '.config' / 'systemd' / 'user' / 'khroxy.service'
+XRAY = Path.home() / '.local' / 'bin' / 'xray'
+SERVICE = 'khroxy.service'
+CONTAINER_MODE = os.environ.get('KHROXY_CONTAINER') == '1'
+GATEWAY_PORT = 20819
+CONTAINER_PID = ROOT / 'xray.pid'
+PORT_START, PORT_END = 20820, 20999
+NAME = re.compile(r'^[a-z][a-z0-9_-]{0,30}$')
+# NO_PROXY is inconsistently interpreted for CIDRs; keep explicit local hostnames.
+DEFAULT_NO_PROXY = 'localhost,127.0.0.1,::1'
+
+
+def fail(message):
+    raise ValueError(message)
+
+
+def safe_label(name):
+    # Labels used in logs must never contain URLs, credentials or control characters.
+    return name if isinstance(name, str) and NAME.fullmatch(name) else '<invalid-name>'
+
+
+def log_event(event, name='', detail=''):
+    """Bounded user-private event journal. No URL, token, outbound, or raw exceptions."""
+    if not re.fullmatch(r'[a-z][a-z_-]{1,30}', event):
+        return
+    safe_detail = detail if detail in (
+        'direct', 'profile', 'any', 'starting', 'ready', 'downloaded',
+        'parsed', 'parsing', 'skipped', 'updated', 'failed', 'unavailable', 'timeout', 'tls',
+        'http-403', 'http-401', 'http-other', 'network', 'unsupported',
+        'proxy-start', 'proxy-config', 'empty', 'too-large', 'offline',
+        'no-profiles', 'connected', 'disconnected') else ''
+    try:
+        ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(EVENTS, os.O_RDWR | os.O_CREAT | os.O_APPEND |
+                     getattr(os, 'O_NOFOLLOW', 0), 0o600)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            if os.fstat(fd).st_size > 128 * 1024:
+                os.lseek(fd, -65536, os.SEEK_END)
+                recent = os.read(fd, 65536).split(b'\n', 1)[-1]
+                os.ftruncate(fd, 0)
+                os.lseek(fd, 0, os.SEEK_SET)
+                os.write(fd, recent)
+            stamp = datetime.now(timezone.utc).strftime('%m-%d %H:%M:%S')
+            row = f'{stamp} {event} {safe_label(name) if name else ""} {safe_detail}\n'
+            os.write(fd, row.encode())
+        finally:
+            os.close(fd)
+    except OSError:
+        # Diagnostics must never make an otherwise successful fetch fail.
+        return
+
+
+def read_events(count=5):
+    try:
+        if EVENTS.is_symlink() or not EVENTS.is_file():
+            return []
+        with EVENTS.open(encoding='utf-8', errors='replace') as stream:
+            stream.seek(max(0, EVENTS.stat().st_size - 65536))
+            content = stream.read().splitlines()
+        return content[-count:]
+    except OSError:
+        return []
+
+
+def check_name(name):
+    if not NAME.fullmatch(name):
+        fail('Names: 1-31 characters, lowercase a-z, digits, underscore or hyphen; start with a letter')
+    return name
+
+
+def host_port(parts):
+    host = parts.hostname
+    try:
+        port = parts.port
+    except ValueError:
+        fail('Invalid port')
+    if not host or port is None or not 1 <= port <= 65535:
+        fail('Share link must include a host and a port')
+    return host, port
+
+
+def query(parts, allowed):
+    args = parse_qs(parts.query, keep_blank_values=True, strict_parsing=False)
+    unknown = set(args) - set(allowed)
+    if unknown:
+        fail('Unsupported share-link parameters: ' + ', '.join(sorted(unknown)) + '; refusing lossy import')
+    if any(len(values) != 1 for values in args.values()):
+        fail('Repeated share-link parameters are ambiguous')
+    return {k: v[0] for k, v in args.items()}
+
+
+def tls_transport(host, q, allow_plaintext=False):
+    network = q.get('type', q.get('net', 'tcp')).lower()
+    network = {'raw': 'tcp', 'websocket': 'ws'}.get(network, network)
+    security = q.get('security', 'none').lower()
+    if network not in ('tcp', 'ws', 'grpc', 'xhttp', 'httpupgrade'):
+        fail('Unsupported transport: ' + network)
+    if security not in ('none', 'tls', 'reality'):
+        fail('Unsupported security: ' + security)
+    if security == 'none' and not allow_plaintext:
+        fail('Plaintext transport refused. Add --allow-plaintext only for an explicitly trusted link')
+    if q.get('allowInsecure', '0').lower() not in ('0', 'false', ''):
+        fail('TLS verification bypass is not supported')
+    if security == 'reality' and network not in ('tcp', 'grpc', 'xhttp'):
+        fail('REALITY cannot be used with this transport')
+    stream = {'network': network, 'security': security}
+    if network == 'ws':
+        stream['wsSettings'] = {'path': q.get('path', '/')}
+        if q.get('host'):
+            stream['wsSettings']['host'] = q['host']
+    elif network == 'httpupgrade':
+        stream['httpupgradeSettings'] = {'path': q.get('path', '/')}
+        if q.get('host'):
+            stream['httpupgradeSettings']['host'] = q['host']
+    elif network == 'grpc':
+        stream['grpcSettings'] = {'serviceName': q.get('serviceName', '')}
+        if q.get('authority'):
+            stream['grpcSettings']['authority'] = q['authority']
+    elif network == 'xhttp':
+        v = {'path': q.get('path', '/')}
+        if q.get('host'):
+            v['host'] = q['host']
+        if q.get('mode'):
+            v['mode'] = q['mode']
+        if 'extra' in q:
+            try:
+                extra = json.loads(q['extra'])
+            except ValueError:
+                fail('Invalid XHTTP extra JSON')
+            if not isinstance(extra, dict):
+                fail('XHTTP extra must be an object')
+            v['extra'] = extra
+        stream['xhttpSettings'] = v
+    elif q.get('headerType', 'none') not in ('none', ''):
+        fail('Nonstandard TCP headerType is not yet supported')
+    server_name = q.get('sni') or host
+    # Xray share-link standard: ech maps directly to tlsSettings.echConfigList.
+    # Do not discard it: stripping ECH silently changes the connection's TLS behavior.
+    if 'ech' in q and security != 'tls' and q['ech']:
+        fail('ECH requires TLS security; refusing to drop the parameter')
+    if security == 'tls':
+        settings = {'serverName': server_name}
+        if q.get('fp'):
+            settings['fingerprint'] = q['fp']
+        if q.get('alpn'):
+            settings['alpn'] = q['alpn'].split(',')
+        if 'ech' in q:
+            value = q['ech']
+            if len(value) > 8192 or any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+                fail('Invalid ECH configuration parameter')
+            # An empty ech parameter is legal under the share-link proposal.
+            # The runtime core decides how to interpret encoded ECH data / DNS source.
+            settings['echConfigList'] = value
+        stream['tlsSettings'] = settings
+    elif security == 'reality':
+        if not q.get('pbk'):
+            fail('REALITY needs pbk (server public key)')
+        settings = {'serverName': server_name,
+                    'fingerprint': q.get('fp', 'chrome'),
+                    'password': q['pbk'], 'shortId': q.get('sid', ''),
+                    'spiderX': q.get('spx', '')}
+        if q.get('pqv'):
+            settings['mldsa65Verify'] = q['pqv']
+        stream['realitySettings'] = settings
+    return stream
+
+
+COMMON = {'type', 'net', 'security', 'sni', 'fp', 'pbk', 'sid', 'spx', 'pqv',
+          'alpn', 'flow', 'encryption', 'path', 'host', 'mode', 'extra',
+          'serviceName', 'authority', 'headerType', 'allowInsecure', 'ech'}
+
+
+def b64decode(value):
+    try:
+        return base64.urlsafe_b64decode(value.strip() + '=' * (-len(value.strip()) % 4)).decode('utf-8')
+    except (ValueError, UnicodeDecodeError) as exc:
+        fail('Invalid base64 share link: ' + type(exc).__name__)
+
+
+def parse_share(link, allow_plaintext=False):
+    link = link.strip()
+    if not link or '\n' in link or '\r' in link or len(link) > 16000:
+        fail('Expected one share link (max 16 KB)')
+    scheme = link.split('://', 1)[0].lower()
+    if scheme not in {'vless', 'vmess', 'trojan', 'ss'}:
+        fail('Supported formats: vless://, vmess://, trojan://, ss://')
+
+    if scheme == 'vmess' and '@' not in link.split('#', 1)[0]:
+        text = link[8:].split('#', 1)[0]
+        try:
+            src = json.loads(b64decode(text))
+        except (ValueError, json.JSONDecodeError):
+            fail('Cannot parse legacy VMess base64 JSON')
+        if not isinstance(src, dict):
+            fail('VMess share link must contain an object')
+        host = src.get('add')
+        try:
+            port = int(src.get('port', 0))
+        except (TypeError, ValueError):
+            fail('Invalid VMess port')
+        if not isinstance(host, str) or not host or not 1 <= port <= 65535:
+            fail('Invalid VMess destination')
+        identity = str(uuid.UUID(str(src.get('id', ''))))
+        net = src.get('net', 'tcp')
+        q = {'type': net,
+             'security': 'tls' if str(src.get('tls', '')).lower() in ('tls', '1', 'true') else 'none'}
+        for src_key, dst_key in [('path', 'path'), ('host', 'host'), ('sni', 'sni'),
+                                 ('fp', 'fp'), ('alpn', 'alpn')]:
+            if src.get(src_key):
+                q[dst_key] = str(src[src_key])
+        if net == 'grpc':
+            q['serviceName'] = str(src.get('path', ''))
+            q.pop('path', None)
+        stream = tls_transport(host, q, allow_plaintext)
+        user = {'id': identity, 'security': src.get('scy') or 'auto',
+                'alterId': int(src.get('aid') or 0)}
+        return {'protocol': 'vmess', 'settings': {'vnext': [
+            {'address': host, 'port': port, 'users': [user]}]},
+            'streamSettings': stream}
+
+    if scheme == 'ss':
+        rest = link[5:].split('#', 1)[0].split('?', 1)
+        if len(rest) > 1 and rest[1]:
+            fail('Shadowsocks plugins/extra parameters not yet supported')
+        raw = rest[0]
+        if '@' not in raw:
+            raw = b64decode(raw)
+        userpart, serverpart = raw.rsplit('@', 1)
+        if ':' not in userpart:
+            userpart = b64decode(userpart)
+        if ':' not in userpart:
+            fail('Shadowsocks link lacks method:password')
+        method, password = userpart.split(':', 1)
+        server = urlsplit('ss://' + serverpart)
+        host, port = host_port(server)
+        if not method or not password:
+            fail('Missing Shadowsocks method or password')
+        return {'protocol': 'shadowsocks', 'settings': {'servers': [
+            {'address': host, 'port': port, 'method': method, 'password': password}]}}
+
+    parts = urlsplit(link)
+    host, port = host_port(parts)
+    q = query(parts, COMMON)
+    if not parts.username:
+        fail('Missing share-link credentials')
+    if scheme == 'vless':
+        identity = str(uuid.UUID(unquote(parts.username)))
+        if q.get('encryption', 'none') != 'none':
+            fail('Advanced VLESS encryption is not supported by this importer')
+        stream = tls_transport(host, q, allow_plaintext)
+        user = {'id': identity, 'encryption': 'none'}
+        if q.get('flow'):
+            user['flow'] = q['flow']
+        return {'protocol': 'vless', 'settings': {'vnext': [
+            {'address': host, 'port': port, 'users': [user]}]},
+            'streamSettings': stream}
+    if scheme == 'vmess':
+        identity = str(uuid.UUID(unquote(parts.username)))
+        stream = tls_transport(host, q, allow_plaintext)
+        user = {'id': identity, 'security': q.get('encryption', 'auto')}
+        return {'protocol': 'vmess', 'settings': {'vnext': [
+            {'address': host, 'port': port, 'users': [user]}]},
+            'streamSettings': stream}
+    if scheme == 'trojan':
+        q.setdefault('security', 'tls')
+        stream = tls_transport(host, q, allow_plaintext)
+        return {'protocol': 'trojan', 'settings': {'servers': [
+            {'address': host, 'port': port, 'password': unquote(parts.username)}]},
+            'streamSettings': stream}
+    fail('Unsupported share link')
+
+
+def write_file(path, data, mode=0o600):
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, name = tempfile.mkstemp(prefix='.khroxy-', dir=str(path.parent))
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, 'wb') as file:
+            file.write(data)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def serial(obj):
+    return (json.dumps(obj, indent=2, ensure_ascii=False) + '\n').encode()
+
+
+def load():
+    ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(ROOT, 0o700)
+    if not STATE.exists():
+        return {'version': 1, 'profiles': {}, 'apps': {}, 'subscriptions': {}}
+    data = json.loads(STATE.read_text())
+    if data.get('version') != 1:
+        fail('Unsupported state version')
+    data.setdefault('subscriptions', {})
+    return data
+
+
+def lock():
+    ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = os.open(ROOT / '.lock', os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
+# A persistent default profile is distinct from the cursor-highlighted row.
+# "@active" and "@fastest" are symbolic application assignments.
+DYNAMIC_ROUTES = ('@active', '@fastest')
+PROBE_URL = 'https://www.gstatic.com/generate_204'
+
+def resolve_profile(state, assignment):
+    name = (state.get('active_profile') if assignment == '@active' else
+            state.get('fastest_profile') if assignment == '@fastest' else assignment)
+    if name not in state['profiles']:
+        fail('No working profile selected for ' + str(assignment))
+    return name
+
+def probe_profile(outbound):
+    """Measure working HTTPS through a temporary Xray instance, not ICMP.
+
+    No running app or installed user service required. Failures are redacted.
+    """
+    try:
+        with temporary_profile_proxy(outbound) as url:
+            result = subprocess.run(['curl', '--noproxy', '', '--proxy', url,
+                       '--connect-timeout', '5', '--max-time', '10',
+                       '-sS', '-o', '/dev/null', '-w', '%{http_code} %{time_total}',
+                       PROBE_URL], text=True, capture_output=True, timeout=13)
+            parts = result.stdout.strip().split()
+            if result.returncode == 0 and len(parts) == 2 and parts[0] == '204':
+                return {'ok': True, 'ms': round(float(parts[1]) * 1000),
+                        'time': int(time.time())}
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass
+    return {'ok': False, 'ms': None, 'time': int(time.time())}
+
+def choose_best(state, max_age=900):
+    now = int(time.time())
+    valid = [(item['ms'], name) for name, item in state.get('health', {}).items()
+             if name in state['profiles'] and item.get('ok') and
+             isinstance(item.get('ms'), (int, float)) and item['ms'] >= 0 and
+             0 <= now - item.get('time', 0) <= max_age]
+    return min(valid)[1] if valid else None
+
+def update_health(name, result, select_fastest=False):
+    fd = lock()
+    try:
+        old = load()
+        if name not in old['profiles']: return
+        new = copy.deepcopy(old)
+        new.setdefault('health', {})[name] = result
+        if select_fastest:
+            best = choose_best(new)
+            if best is not None: new['fastest_profile'] = best
+            elif '@fastest' not in {a['profile'] for a in new['apps'].values()}:
+                new['fastest_profile'] = None
+        if (serial(build_runtime(new)) != serial(build_runtime(old))):
+            commit(old, new)
+        else: write_file(STATE, serial(new))
+    finally: os.close(fd)
+
+def select_active(name):
+    fd = lock()
+    try:
+        old = load()
+        if name not in old['profiles']: fail('Unknown profile')
+        new = copy.deepcopy(old); new['active_profile'] = name
+        new['selection_mode'] = 'active'
+        if serial(build_runtime(old)) != serial(build_runtime(new)):
+            commit(old, new)
+        else: write_file(STATE, serial(new))
+    finally: os.close(fd)
+    print('Active profile:', name)
+
+def activate_fastest():
+    fd = lock()
+    try:
+        old = load(); best = choose_best(old)
+        if not best: fail('No recently healthy profile; press P or use ping --all')
+        new = copy.deepcopy(old)
+        new['fastest_profile'] = best
+        new['selection_mode'] = 'fastest'
+        if serial(build_runtime(old)) != serial(build_runtime(new)):
+            commit(old, new)
+        else:
+            write_file(STATE, serial(new))
+        print('Fastest mode selected:', best)
+    finally:
+        os.close(fd)
+
+
+def test_profiles(names, select_fastest=False):
+    snapshot = load()
+    if not names: fail('No profiles to test')
+    for name in names:
+        if name not in snapshot['profiles']: fail('Unknown profile: ' + name)
+        log_event('probe_start', name)
+        result = probe_profile(snapshot['profiles'][name])
+        update_health(name, result, select_fastest=False)
+        log_event('probe_ok' if result['ok'] else 'probe_fail', name,
+                  'connected' if result['ok'] else 'unavailable')
+        print(name, f"{result['ms']} ms" if result['ok'] else 'FAIL')
+    if select_fastest:
+        snapshot = load()
+        best = choose_best(snapshot)
+        print('Fastest:', best or 'none working; no direct fallback')
+        if not best: fail('No working profile; fastest selection unchanged')
+        fd = lock()
+        try:
+            old = load()
+            new = copy.deepcopy(old); new['fastest_profile'] = best
+            if serial(build_runtime(old)) != serial(build_runtime(new)): commit(old, new)
+            else: write_file(STATE, serial(new))
+        finally: os.close(fd)
+        if CONTAINER_MODE and not running():
+            cmd_unit()
+
+
+def build_runtime(state):
+    apps = state['apps']
+    referenced = {resolve_profile(state, a['profile']) for a in apps.values()}
+    config = {'log': {'loglevel': 'warning'}, 'inbounds': [], 'outbounds': [],
+              'routing': {'domainStrategy': 'AsIs', 'rules': []}}
+    for name in sorted(referenced):
+        outbound = copy.deepcopy(state['profiles'][name])
+        outbound['tag'] = 'profile-' + name
+        config['outbounds'].append(outbound)
+    for name, app in sorted(apps.items()):
+        tag = 'app-' + name
+        config['inbounds'].append({'tag': tag, 'listen': '127.0.0.1',
+                                   'port': app['port'], 'protocol': 'http',
+                                   'settings': {}})
+        config['routing']['rules'].append({
+            'type': 'field', 'inboundTag': [tag],
+            'outboundTag': 'profile-' + resolve_profile(state, app['profile'])})
+    if CONTAINER_MODE:
+        # Publish one dedicated shared HTTP gateway in the container. Never use
+        # an Xray "freedom" outbound or fall back to direct when unconfigured.
+        gateway_profile = (state.get('fastest_profile') if
+                           state.get('selection_mode') == 'fastest' else
+                           state.get('active_profile'))
+        if gateway_profile in state['profiles']:
+            tag = 'profile-' + gateway_profile
+            if tag not in {o['tag'] for o in config['outbounds']}:
+                config['outbounds'].append(dict(copy.deepcopy(state['profiles'][gateway_profile]), tag=tag))
+            config['inbounds'].append({'tag':'gateway', 'listen':'0.0.0.0',
+                                       'port':GATEWAY_PORT, 'protocol':'http', 'settings':{}})
+            config['routing']['rules'].append({'type':'field','inboundTag':['gateway'],
+                                               'outboundTag':tag})
+    return config
+
+
+def xray_test(payload):
+    if not XRAY.is_file() or not os.access(XRAY, os.X_OK):
+        fail('Xray not found at ' + str(XRAY))
+    fd, name = tempfile.mkstemp(prefix='.khroxy-test-', suffix='.json', dir=ROOT)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, 'wb') as file:
+            file.write(payload)
+        result = subprocess.run([str(XRAY), 'run', '-test', '-config', name],
+                                text=True, capture_output=True, timeout=20)
+        if result.returncode:
+            # Xray errors may embed server names; report locally only.
+            fail('Xray config validation failed:\n' + (result.stderr or result.stdout)[-800:])
+    finally:
+        os.unlink(name)
+
+
+def _container_owned_pid():
+    if not CONTAINER_PID.is_file() or CONTAINER_PID.is_symlink(): return None
+    try:
+        pid = int(CONTAINER_PID.read_text().strip())
+        if pid <= 1: return None
+        cmd = Path(f'/proc/{pid}/cmdline').read_bytes().replace(b'\x00', b' ').decode(errors='replace')
+        uid_line = next(x for x in Path(f'/proc/{pid}/status').read_text().splitlines()
+                        if x.startswith('Uid:'))
+        if (str(XRAY) in cmd and str(RUNTIME) in cmd and
+                int(uid_line.split()[1]) == os.geteuid()):
+            return pid
+    except (OSError, ValueError, StopIteration):
+        pass
+    return None
+
+
+def _container_ctl(*args):
+    """Minimal container-mode process control; does not invoke systemd."""
+    done = lambda rc=0, err='': subprocess.CompletedProcess(['container', *args], rc, '', err)
+    op = args[0] if args else None
+    if op == 'daemon-reload': return done()
+    if op == 'is-active': return done(0 if _container_owned_pid() else 3)
+    if op in ('restart', 'stop', 'disable', 'enable'):
+        old = _container_owned_pid()
+        if old and op in ('restart', 'stop', 'disable'):
+            try: os.kill(old, signal.SIGTERM)
+            except ProcessLookupError: pass
+            for _ in range(35):
+                if not _container_owned_pid(): break
+                time.sleep(.1)
+            if _container_owned_pid(): return done(1, 'Xray did not stop')
+            CONTAINER_PID.unlink(missing_ok=True)
+        if op in ('stop', 'disable'): return done()
+        if op == 'enable' and old: return done()
+        if not RUNTIME.is_file(): return done(1, 'No generated Xray runtime')
+        try:
+            config = json.loads(RUNTIME.read_text())
+            if not config.get('inbounds'): return done(1, 'No configured proxy listener')
+            # Use a detached process; no root-capable Xray in this mode.
+            proc = subprocess.Popen([str(XRAY), 'run', '-config', str(RUNTIME)],
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, start_new_session=True)
+            write_file(CONTAINER_PID, (str(proc.pid) + '\n').encode())
+            time.sleep(.2)
+            if proc.poll() is not None: return done(1, 'Xray exited during startup')
+            return done()
+        except (OSError, ValueError) as exc:
+            return done(1, type(exc).__name__)
+    return done(1, 'Unsupported container service operation')
+
+
+def systemctl(*args, timeout=15):
+    """User systemd calls must never wait forever on a stuck session bus."""
+    if CONTAINER_MODE:
+        return _container_ctl(*args)
+    try:
+        return subprocess.run(['systemctl', '--user', *args],
+                              capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        fail('User systemd manager not responding; command timed out')
+
+
+def running():
+    return systemctl('is-active', '--quiet', SERVICE, timeout=2).returncode == 0
+
+
+def start_status_monitor(interval=3):
+    """Poll service status on a daemon worker: UI painting never runs systemctl."""
+    cache = {'value': 'CHECKING'}
+    stop = threading.Event()
+
+    def poll():
+        while not stop.is_set():
+            try:
+                result = systemctl('is-active', '--quiet', SERVICE, timeout=2)
+                cache['value'] = 'ACTIVE' if result.returncode == 0 else 'OFFLINE'
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                cache['value'] = 'UNKNOWN'
+            stop.wait(interval)
+
+    threading.Thread(target=poll, name='khroxy-service-status', daemon=True).start()
+    return cache, stop
+
+
+def listener_ready(port, tries=8):
+    for _ in range(tries):
+        try:
+            with socket.create_connection(('127.0.0.1', port), timeout=1):
+                return True
+        except OSError:
+            time.sleep(1)
+    return False
+
+
+def check_proxy(port, attempts=4):
+    for n in range(attempts):
+        result = subprocess.run(['curl', '--noproxy', '',
+            '--proxy', f'http://127.0.0.1:{port}', '--connect-timeout', '5',
+            '--max-time', '12', '-sS', '-o', '/dev/null', '-w', '%{http_code}',
+            'https://www.gstatic.com/generate_204'],
+            text=True, capture_output=True)
+        if result.returncode == 0 and result.stdout.strip() == '204':
+            return True, 'HTTP 204'
+        error = result.stderr.strip()[-150:] or result.stdout.strip()
+        if n < attempts-1:
+            time.sleep(2)
+    return False, error or 'Connectivity test failed'
+
+
+def commit(state, proposed, probe_app=None):
+    # Always serialize writes under a lock; state is committed only after
+    # the new config is valid and, when running, the new service is healthy.
+    payload = serial(build_runtime(proposed))
+    if build_runtime(proposed)['inbounds']:
+        xray_test(payload)
+    live = running()
+    old_bytes = RUNTIME.read_bytes() if RUNTIME.exists() else None
+    if live and not build_runtime(proposed)['inbounds']:
+        # Removing the last app must also stop/disable its service, never leave
+        # an enabled daemon with no assigned proxy listeners.
+        stopped = systemctl('disable', '--now', SERVICE)
+        if stopped.returncode or running():
+            fail('Could not stop the last app proxy; no state changes made')
+        write_file(RUNTIME, payload)
+        write_file(STATE, serial(proposed))
+        return
+    write_file(RUNTIME, payload)
+    if live:
+        restarted = systemctl('restart', SERVICE)
+        ok = restarted.returncode == 0 and running()
+        if ok:
+            for name, app in proposed['apps'].items():
+                if not listener_ready(app['port'], tries=5):
+                    ok = False
+                    break
+        if ok and probe_app:
+            good, details = check_proxy(proposed['apps'][probe_app]['port'])
+            ok = good
+            if not ok:
+                print('New profile health check:', details, file=sys.stderr)
+        if not ok:
+            if old_bytes is None:
+                RUNTIME.unlink(missing_ok=True)
+            else:
+                write_file(RUNTIME, old_bytes)
+            restore = systemctl('restart', SERVICE)
+            restored = restore.returncode == 0 and running()
+            if restored:
+                restored = all(listener_ready(app['port'], tries=3) for app in state['apps'].values())
+            fail('New configuration failed; previous runtime file restored. '
+                 f'Service and listener restoration verified: {restored}; outbound connectivity not verified. Check systemctl --user status khroxy')
+    write_file(STATE, serial(proposed))
+
+
+def cmd_import(state, name, allow_plaintext=False):
+    check_name(name)
+    if name in state['profiles']:
+        fail('Profile already exists')
+    link = (getpass.getpass('Paste share link (hidden): ') if sys.stdin.isatty()
+            else sys.stdin.readline().strip())
+    outbound = parse_share(link, allow_plaintext)
+    proposed = copy.deepcopy(state)
+    proposed['profiles'][name] = outbound
+    # Import does not change any running listener or profile selection.
+    write_file(STATE, serial(proposed))
+    print(f'Imported {name} ({outbound["protocol"]}). Nothing switched.')
+
+
+def cmd_app_add(state, name, profile, command):
+    check_name(name)
+    if name in state['apps']:
+        fail('Application exists')
+    if profile not in state['profiles'] and profile not in DYNAMIC_ROUTES:
+        fail('Unknown profile (or use @active or @fastest)')
+    resolve_profile(state, profile)
+    argv = shlex.split(command)
+    if not argv:
+        fail('Application command required')
+    if shutil.which(argv[0]) is None:
+        fail('Command not found: ' + argv[0])
+    ports = {item['port'] for item in state['apps'].values()}
+    for port in range(PORT_START, PORT_END + 1):
+        if port in ports:
+            continue
+        # Avoid colliding with unrelated services already using the port.
+        with socket.socket() as sock:
+            if sock.connect_ex(('127.0.0.1', port)) == 0:
+                continue
+        break
+    else:
+        fail('No available local proxy port')
+    proposed = copy.deepcopy(state)
+    proposed['apps'][name] = {'port': port, 'profile': profile, 'command': argv}
+    commit(state, proposed)
+    print(f'Application {name} configured on 127.0.0.1:{port} → {profile}')
+    if not running():
+        print('Start manager with: khroxy install')
+
+
+def cmd_switch(state, name, profile):
+    if name not in state['apps'] or (profile not in state['profiles'] and profile not in DYNAMIC_ROUTES):
+        fail('Unknown app or profile')
+    resolve_profile(state, profile)
+    if state['apps'][name]['profile'] == profile:
+        print('Already selected:', profile)
+        return
+    proposed = copy.deepcopy(state)
+    proposed['apps'][name]['profile'] = profile
+    commit(state, proposed, probe_app=name if running() else None)
+    print(f'Switched {name} → {profile}' + (' (HTTP 204)' if running() else ' (service offline: unverified)'))
+
+
+def cmd_run(state, name, extras):
+    if name not in state['apps']:
+        fail('Unknown app')
+    app = state['apps'][name]
+    port = app['port']
+    if not running() or not listener_ready(port, tries=1):
+        fail('khroxy service/listener is not running')
+    env = os.environ.copy()
+    proxy = f'http://127.0.0.1:{port}'
+    for key in ['HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','http_proxy','https_proxy','all_proxy']:
+        env[key] = proxy
+    env['NO_PROXY'] = env['no_proxy'] = DEFAULT_NO_PROXY
+    env['NODE_USE_ENV_PROXY'] = '1'
+    argv = app['command'] + ([a for a in extras if a != '--'] if extras else [])
+    os.execvpe(argv[0], argv, env)
+
+
+# Bash integration shadows selected command names only inside opted-in shells.
+# No installed app binary or system PATH directory is modified.
+SHELL_LINE = '[ -x "$HOME/.local/bin/khroxy" ] && eval "$("$HOME/.local/bin/khroxy" shell-init bash)" # khroxy-shell-hook\n'
+BASH_RESERVED = {'sudo', 'su', 'ssh', 'scp', 'sftp', 'rm', 'mv', 'cp', 'cat',
+                 'bash', 'sh', 'python', 'python3', 'systemctl', 'kill', 'pkill',
+                 'curl', 'wget', 'env', 'source', 'exec', 'command', 'khroxy'}
+
+
+def shell_functions(state):
+    lines = []
+    for name, app in sorted(state['apps'].items()):
+        cmd = app.get('command', [])
+        if not cmd or not NAME.fullmatch(name) or cmd[0] != name or name in BASH_RESERVED:
+            continue
+        # App name must match the executable being wrapped; do not shadow an
+        # arbitrary command based on a differently named app assignment.
+        lines.append(f'{name}() {{ "$HOME/.local/bin/khroxy" run {shlex.quote(name)} "$@"; }}')
+    return lines
+
+
+def cmd_shell_init(shell='bash'):
+    if shell != 'bash':
+        fail('Only bash shell integration is supported in this release')
+    for line in shell_functions(load()):
+        print(line)
+
+
+def bashrc_path():
+    return Path.home() / '.bashrc'
+
+
+def cmd_shell_enable():
+    rc = bashrc_path()
+    if rc.is_symlink() or (rc.exists() and not rc.is_file()):
+        fail('Cannot safely modify symlink/non-file ~/.bashrc')
+    original = rc.read_text() if rc.exists() else ''
+    if SHELL_LINE.rstrip('\n') in original.splitlines():
+        print('Bash integration already enabled')
+        return
+    # Never overwrite or replace an existing startup file.
+    with rc.open('a') as f:
+        if original and not original.endswith('\n'):
+            f.write('\n')
+        f.write(SHELL_LINE)
+    print('Bash integration enabled for new shells. Run: eval "$(khroxy shell-init bash)"')
+
+
+def cmd_shell_disable():
+    rc = bashrc_path()
+    if rc.is_symlink():
+        fail('Refusing symlink ~/.bashrc')
+    if not rc.is_file():
+        return
+    original = rc.read_text()
+    lines = original.splitlines(keepends=True)
+    remaining = [line for line in lines if line.rstrip('\r\n') != SHELL_LINE.rstrip('\n')]
+    if len(lines) == len(remaining):
+        return
+    mode = rc.stat().st_mode & 0o777
+    write_file(rc, ''.join(remaining).encode(), mode)
+    print('Removed khroxy bash hook (open shells need a new session)')
+
+
+def cmd_unit():
+    if CONTAINER_MODE:
+        st = load()
+        selected = st.get('fastest_profile') if st.get('selection_mode') == 'fastest' else st.get('active_profile')
+        if selected not in st['profiles']:
+            fail('Select an available profile first (Enter or g in Profiles)')
+        payload = serial(build_runtime(st))
+        xray_test(payload)
+        write_file(RUNTIME, payload)
+        r = systemctl('enable', '--now', SERVICE)
+        if r.returncode or not running() or not listener_ready(GATEWAY_PORT, tries=5):
+            fail('Container gateway did not start; no direct fallback')
+        print('Container gateway active on port', GATEWAY_PORT)
+        return
+    if not STATE.exists() or not load()['apps']:
+        fail('Import a profile and add an application before installing the service')
+    if UNIT.exists() and 'Managed by khroxy' not in UNIT.read_text():
+        fail(f'{UNIT} exists but is not managed by khroxy; refusing overwrite')
+    # ensure valid current runtime before installing
+    xray_test(RUNTIME.read_bytes())
+    UNIT.parent.mkdir(parents=True, exist_ok=True)
+    contents = ('# Managed by khroxy\n'
+                '[Unit]\nDescription=khroxy private per-app Xray proxy\n'
+                'After=network-online.target\nWants=network-online.target\n\n'
+                '[Service]\nType=simple\n'
+                f'ExecStart={XRAY} run -config {RUNTIME}\n'
+                'Restart=on-failure\nRestartSec=3\nNoNewPrivileges=true\n'
+                'UMask=0077\n\n'
+                '[Install]\nWantedBy=default.target\n')
+    write_file(UNIT, contents.encode(), 0o644)
+    r = systemctl('daemon-reload')
+    if r.returncode:
+        fail('systemd reload failed: ' + r.stderr.strip())
+    r = systemctl('enable', '--now', SERVICE)
+    if r.returncode or not running():
+        fail('Service did not start: ' + r.stderr.strip() + '\nCheck systemctl --user status khroxy')
+    for name, app in load()['apps'].items():
+        if not listener_ready(app['port']):
+            fail('Service started but proxy listener not ready: ' + name)
+    print('khroxy user service active (does not alter codex-xray).')
+
+
+def show_profiles(state):
+    if not state['profiles']:
+        print('No profiles. Use: khroxy import NAME')
+    chosen = (state.get('fastest_profile') if state.get('selection_mode') == 'fastest'
+              else state.get('active_profile'))
+    for name, prof in sorted(state['profiles'].items()):
+        health = state.get('health', {}).get(name, {})
+        latency = f'{health["ms"]}ms' if health.get('ok') else ('FAIL' if health else '--')
+        print(f'{"*" if chosen == name else " "} {name:20} {prof["protocol"]:12} {latency:>7} (credentials hidden)')
+
+
+def show_apps(state):
+    if not state['apps']:
+        print('No applications. Use: khroxy app-add NAME --profile NAME --command "..."')
+    for name, app in sorted(state['apps'].items()):
+        print(f'  {name:18} :{app["port"]} → {app["profile"]:16} command={shlex.join(app["command"])}')
+
+
+
+# Subscription sources are independent of app routing and manually imported
+# profiles. A subscription's URL may contain a bearer token: never log it.
+MAX_SUB_BYTES = 1024 * 1024
+MAX_SUB_PROFILES = 100
+MIN_UPDATE_MINUTES = 15
+
+
+def validate_subscription_url(url):
+    if len(url) > 4096 or any(c.isspace() or ord(c) < 32 for c in url):
+        fail('Invalid subscription URL')
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname
+        port = parts.port
+    except ValueError:
+        fail('Invalid subscription URL')
+    if parts.scheme != 'https' or not host or parts.username or parts.password or parts.fragment:
+        fail('Subscription URL must be HTTPS without embedded username or fragment')
+    if port and not 1 <= port <= 65535:
+        fail('Invalid subscription URL port')
+    if host.lower() == 'localhost' or host.lower().endswith(('.localhost', '.local', '.home.arpa', '.internal')):
+        fail('Subscription URL cannot point to a local host')
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        address = None
+    if address is not None and not address.is_global:
+        fail('Subscription URL must use a public host')
+    return url
+
+
+class _ExplicitHttpsProxy(urlrequest.ProxyHandler):
+    """Force the selected localhost HTTP proxy, ignoring NO_PROXY environment."""
+    def __init__(self, proxy):
+        super().__init__({'https': proxy})
+
+    def proxy_open(self, req, proxy, type):
+        parts = urlsplit(proxy)
+        if (type != 'https' or parts.scheme != 'http' or
+                parts.hostname != '127.0.0.1' or not parts.port or
+                parts.username or parts.password):
+            fail('Unsafe subscription proxy endpoint')
+        # urllib's standard ProxyHandler silently honors NO_PROXY, even when
+        # a specific proxy is explicitly requested. set_proxy always tunnels
+        # HTTPS via CONNECT while preserving TLS verification.
+        req.set_proxy(f'127.0.0.1:{parts.port}', 'http')
+        return None
+
+
+class _NoRedirect(urlrequest.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def fetch_subscription(url, proxy=None):
+    """TLS-verified HTTPS only; no implicit system proxy or redirects."""
+    validate_subscription_url(url)
+    handler = _ExplicitHttpsProxy(proxy) if proxy else urlrequest.ProxyHandler({})
+    opener = urlrequest.build_opener(handler, _NoRedirect())
+    req = urlrequest.Request(url, headers={'User-Agent': 'khroxy/0.5',
+                                           'Accept': 'text/plain, */*'})
+    try:
+        with opener.open(req, timeout=18) as response:
+            data = response.read(MAX_SUB_BYTES + 1)
+    except urlerror.HTTPError as e:
+        fail(f'Subscription server returned HTTP {e.code} (URLs withheld)')
+    except (urlerror.URLError, TimeoutError, OSError) as e:
+        reason = getattr(e, 'reason', e)
+        if isinstance(reason, (TimeoutError, socket.timeout)):
+            fail('Subscription connection timed out (URL withheld)')
+        if isinstance(reason, (ssl.SSLError, ssl.SSLCertVerificationError)):
+            fail('Subscription TLS verification failed (URL withheld)')
+        if isinstance(reason, ConnectionRefusedError):
+            fail('Local proxy connection refused (URL withheld)')
+        fail(f'Subscription network failure ({type(reason).__name__}; URL withheld)')
+    if len(data) > MAX_SUB_BYTES:
+        fail('Subscription response exceeds 1 MiB limit')
+    if not data.strip():
+        fail('Subscription response is empty')
+    return data
+
+
+def parse_subscription(data, allow_plaintext=False, skip_unsupported=False, skipped=None):
+    if len(data) > MAX_SUB_BYTES:
+        fail('Subscription exceeds 1 MiB limit')
+    try:
+        text = data.decode('utf-8-sig').strip()
+    except UnicodeError:
+        fail('Subscription is not UTF-8')
+    if not text:
+        fail('Empty subscription')
+    if not any(x in text.lower() for x in ('vless://', 'vmess://', 'trojan://', 'ss://')):
+        try:
+            # Strictly parse standard/URL-safe base64, ignoring whitespace.
+            enc = ''.join(text.split())
+            raw = base64.b64decode(enc.replace('-', '+').replace('_', '/')
+                + '=' * (-len(enc) % 4), validate=True)
+            text = raw.decode('utf-8-sig').strip()
+        except (ValueError, UnicodeError, base64.binascii.Error):
+            fail('Unsupported subscription body (expected share links or base64 list)')
+    if len(text) > MAX_SUB_BYTES:
+        fail('Decoded subscription too large')
+    lines = [x.strip() for x in text.splitlines() if x.strip() and not x.lstrip().startswith('#')]
+    if not 1 <= len(lines) <= MAX_SUB_PROFILES:
+        fail('Subscription must contain 1–100 share links')
+    result = []
+    for i, link in enumerate(lines, 1):
+        try:
+            result.append(parse_share(link, allow_plaintext))
+        except ValueError as e:
+            # Unsupported protocol/feature: skip the *entire* node, never strip its
+            # parameters. Malformed supported nodes still abort the transaction.
+            reason = str(e)
+            unsupported = reason.startswith((
+                'Unsupported share-link parameters:', 'Unsupported transport:',
+                'Unsupported security:', 'Supported formats:',
+                'ECH requires TLS security;',
+                'Shadowsocks plugins/extra parameters not yet supported',
+                'Advanced VLESS encryption is not supported',
+                'Nonstandard TCP headerType is not yet supported',
+                # An unencrypted share link is an intentionally unsupported
+                # *subscription node* unless this feed explicitly opted in.
+                # Never weaken the per-link parser or strip its security mode.
+                'Plaintext transport refused.'))
+            if skip_unsupported and unsupported:
+                if skipped is not None:
+                    skipped.append(i)  # only index, no credentials or server metadata
+                continue
+            # Never reproduce the credential-containing share link.
+            fail(f'Invalid or unsupported subscription link #{i}: {reason}')
+    if not result:
+        fail('Subscription has no supported profiles; previous data retained')
+    return result
+
+
+def make_sub_profiles(subname, parsed):
+    result = {}
+    for outbound in parsed:
+        digest = hashlib.sha256(serial(outbound)).hexdigest()[:10]
+        name = f'{subname}-{digest}'
+        result[name] = outbound
+    if not result:
+        fail('Subscription contains no usable profiles')
+    return result
+
+
+@contextmanager
+def temporary_profile_proxy(outbound):
+    """Temporary local Xray listener to fetch a feed through an unassigned profile."""
+    if not XRAY.is_file() or not os.access(XRAY, os.X_OK):
+        fail('Xray executable is missing')
+    with socket.socket() as sk:
+        sk.bind(('127.0.0.1', 0))
+        port = sk.getsockname()[1]
+    config = {'log': {'loglevel': 'warning'},
+              'inbounds': [{'tag': 'feed', 'listen': '127.0.0.1', 'port': port,
+                             'protocol': 'http', 'settings': {}}],
+              'outbounds': [dict(copy.deepcopy(outbound), tag='feed-out')],
+              'routing': {'rules': [{'type': 'field', 'inboundTag': ['feed'],
+                                     'outboundTag': 'feed-out'}]}}
+    fd, tmp = tempfile.mkstemp(prefix='.khroxy-feed-', suffix='.json', dir=ROOT)
+    proc = None
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, 'wb') as file:
+            file.write(serial(config))
+        test = subprocess.run([str(XRAY), 'run', '-test', '-config', tmp],
+                              capture_output=True, timeout=20)
+        if test.returncode:
+            fail('Profile cannot start (Xray validation failed; details withheld)')
+        proc = subprocess.Popen([str(XRAY), 'run', '-config', tmp],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                start_new_session=True)
+        if not listener_ready(port, tries=8) or proc.poll() is not None:
+            fail('Temporary Xray proxy failed to start')
+        yield f'http://127.0.0.1:{port}'
+    finally:
+        if proc is not None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=4)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=4)
+        Path(tmp).unlink(missing_ok=True)
+
+
+def _reason_code(error):
+    message = str(error).lower()
+    if 'http 403' in message: return 'http-403'
+    if 'http 401' in message: return 'http-401'
+    if 'http ' in message: return 'http-other'
+    if 'tls' in message or 'certificate' in message: return 'tls'
+    if 'timed out' in message or 'timeout' in message: return 'timeout'
+    if 'failed to start' in message: return 'proxy-start'
+    if 'validation failed' in message: return 'proxy-config'
+    if ('unsupported' in message or 'share-link' in message or 'subscription' in message
+            or 'ech requires tls' in message): return 'unsupported'
+    return 'network'
+
+
+def get_feed_with_mode(state, entry, label=''):
+    mode = entry['mode']
+    log_event('fetch_start', label, mode)
+    if mode == 'direct':
+        try:
+            result = fetch_subscription(entry['url'])
+            log_event('fetch_ok', label, 'downloaded')
+            return result
+        except (ValueError, OSError, subprocess.TimeoutExpired) as e:
+            log_event('fetch_fail', label, _reason_code(e))
+            raise
+    if mode == 'profile':
+        candidates = [entry.get('via')]
+    elif mode == 'any':
+        # Includes imported profiles even with ZERO registered apps and
+        # with khroxy.service stopped. A temporary Xray process is launched.
+        # A stale app assignment must not prevent trying valid profiles. This
+        # matters when @fastest or @active has no current selection yet.
+        active = []
+        for app in state['apps'].values():
+            try:
+                chosen = resolve_profile(state, app['profile'])
+            except ValueError:
+                continue
+            if chosen in state['profiles']:
+                active.append(chosen)
+        candidates = list(dict.fromkeys(active + sorted(state['profiles'])))
+    else:
+        fail('Invalid subscription routing mode')
+    reasons = []
+    for name in candidates:
+        if name not in state['profiles']:
+            reasons.append('missing profile')
+            log_event('route_fail', label, 'no-profiles')
+            continue
+        log_event('route_try', name, 'starting')
+        try:
+            with temporary_profile_proxy(state['profiles'][name]) as proxy:
+                log_event('route_ready', name, 'ready')
+                data = fetch_subscription(entry['url'], proxy=proxy)
+                log_event('fetch_ok', label, 'downloaded')
+                return data
+        except (ValueError, OSError, subprocess.TimeoutExpired) as e:
+            code = _reason_code(e)
+            log_event('route_fail', name, code)
+            reasons.append(code)
+    if not candidates:
+        log_event('fetch_fail', label, 'no-profiles')
+        fail('No profiles available for subscription fetching; no application assignment is required')
+    log_event('fetch_fail', label, 'failed')
+    fail(f'Subscription fetch failed via {len(candidates)} profile(s) ({", ".join(reasons)}); previous profiles retained; see Logs')
+
+
+def update_feed(state, name, now=None):
+    if name not in state['subscriptions']:
+        fail('Unknown subscription')
+    entry = state['subscriptions'][name]
+    body = get_feed_with_mode(state, entry, name)
+    log_event('fetch_parse', name, 'parsing')
+    skipped = []
+    try:
+        parsed = parse_subscription(body, entry.get('allow_plaintext', False),
+                                    skip_unsupported=True, skipped=skipped)
+    except ValueError:
+        log_event('parse_fail', name, 'unsupported')
+        raise
+    if skipped:
+        log_event('parse_skip', name, 'skipped')
+    log_event('fetch_parse', name, 'parsed')
+    profiles = make_sub_profiles(name, parsed)
+    proposed = copy.deepcopy(state)
+    old_owned = set(entry.get('profiles', []))
+    # Never overwrite manual profiles or profiles managed by other sources.
+    foreign = (set(profiles) & set(state['profiles'])) - old_owned
+    if foreign:
+        fail('Subscription profile-name collision; previous data retained')
+    updated = proposed['subscriptions'][name]
+    used = {resolve_profile(state, app['profile']) for app in state['apps'].values()}
+    # A profile selected as a subscription transport is also in use.
+    used.update(n for n in (state.get('active_profile'), state.get('fastest_profile')) if n)
+    used.update(sub.get('via') for sub in state['subscriptions'].values()
+                if sub.get('mode') == 'profile')
+    # A partial feed is not an authoritative deletion list. Preserve ALL old
+    # subscription nodes on partial imports, not only application assignments.
+    stale = ((old_owned - set(profiles)) if skipped else
+             (old_owned - set(profiles)) & used)
+    for profile in old_owned - set(profiles) - stale:
+        proposed['profiles'].pop(profile, None)
+    proposed['profiles'].update(profiles)
+    # Preserve a retained assigned profile's ownership for later cleanup.
+    updated['profiles'] = sorted(set(profiles) | stale)
+    updated['last_ok'] = int(now if now is not None else time.time())
+    updated['last_error'] = ''
+    updated['last_skipped'] = len(skipped)
+    updated['stale'] = sorted(stale)
+    affected_apps = [app for app, config in state['apps'].items()
+                     if resolve_profile(state, config['profile']) in set(profiles) and
+                     state['profiles'].get(resolve_profile(state, config['profile'])) != profiles[resolve_profile(state, config['profile'])]]
+    if serial(build_runtime(proposed)) != serial(build_runtime(state)):
+        # Only restart the service when its *effective app routes* have changed.
+        # Downloaded unused source profiles must never cause service downtime.
+        commit(state, proposed, probe_app=affected_apps[0] if affected_apps and running() else None)
+    else:
+        write_file(STATE, serial(proposed))
+    log_event('fetch_saved', name, 'updated')
+    print(f'Subscription {name}: {len(profiles)} profiles; {len(skipped)} unsupported skipped; {len(stale)} previous profiles retained')
+    return proposed
+
+
+def add_feed(state, name, url, mode='direct', via=None, allow_plaintext=False):
+    check_name(name)
+    if len(name) > 20:
+        fail('Subscription names must be at most 20 characters')
+    if name in state['subscriptions']:
+        fail('Subscription name already exists')
+    validate_subscription_url(url)
+    if mode not in ('direct', 'profile', 'any'):
+        fail('Choose direct, profile or any')
+    if mode == 'profile' and via not in state['profiles']:
+        fail('Selected fetch profile is not configured')
+    proposed = copy.deepcopy(state)
+    proposed['subscriptions'][name] = {'url': url, 'mode': mode,
+         'via': via if mode == 'profile' else None,
+         'allow_plaintext': allow_plaintext, 'minutes': 0, 'profiles': [],
+         'last_ok': None, 'last_error': '', 'stale': []}
+    write_file(STATE, serial(proposed))
+    print(f'Subscription {name} saved (not fetched). Use khroxy sub-update {name}.')
+
+
+def remove_feed(state, name):
+    if name not in state['subscriptions']:
+        fail('Unknown subscription')
+    proposed = copy.deepcopy(state)
+    entry = proposed['subscriptions'].pop(name)
+    used = {resolve_profile(state, x['profile']) for x in state['apps'].values()}
+    used.update(n for n in (state.get('active_profile'), state.get('fastest_profile')) if n)
+    used.update(sub.get('via') for sub in proposed['subscriptions'].values()
+                if sub.get('mode') == 'profile')
+    for profile in entry['profiles']:
+        if profile not in used:
+            proposed['profiles'].pop(profile, None)
+    # A referenced profile becomes a normal manually managed profile.
+    if serial(build_runtime(proposed)) != serial(build_runtime(state)):
+        commit(state, proposed)
+    else:
+        write_file(STATE, serial(proposed))
+    print(f'Removed subscription {name}; assigned profiles retained as local profiles')
+
+
+def show_feeds(state):
+    if not state['subscriptions']:
+        print('No subscriptions. Add with khroxy sub-add NAME')
+    for name, sub in sorted(state['subscriptions'].items()):
+        time_label = datetime.fromtimestamp(sub['last_ok'], timezone.utc).strftime('%Y-%m-%d %H:%M UTC') if sub.get('last_ok') else 'never'
+        auto = f'every {sub["minutes"]}m' if sub.get('minutes') else 'off'
+        print(f'  {name:20} via={sub["mode"]:7} count={len(sub["profiles"]):3} auto={auto:12} last={time_label}')
+
+
+def _auto_units_content():
+    exe = Path.home() / '.local' / 'bin' / 'khroxy'
+    service = ('# Managed by khroxy\n[Unit]\nDescription=Update khroxy subscriptions\n'
+               '[Service]\nType=oneshot\n'
+               f'ExecStart={exe} sub-update --due\n'
+               'NoNewPrivileges=true\nUMask=0077\n')
+    timer = ('# Managed by khroxy\n[Unit]\nDescription=khroxy subscription update schedule\n'
+             '[Timer]\nOnCalendar=*:0/15\nPersistent=true\n'
+             'Unit=khroxy-sub-update.service\n'
+             '[Install]\nWantedBy=timers.target\n')
+    return service.encode(), timer.encode()
+
+
+def sync_auto_timer(state):
+    if CONTAINER_MODE:
+        # The container scheduler checks --due; no systemd instance is present.
+        return
+    needed = any(sub.get('minutes', 0) > 0 for sub in state['subscriptions'].values())
+    for path in (AUTOSERVICE_UNIT, AUTOTIMER_UNIT):
+        if path.exists() and (path.is_symlink() or not path.read_text().startswith('# Managed by khroxy\n')):
+            fail(f'Unrecognized timer unit at {path}, refusing to change it')
+    if needed:
+        # Do not spawn a timer for a transient non-installed binary.
+        exe = Path.home() / '.local' / 'bin' / 'khroxy'
+        if not exe.is_file():
+            fail('Install khroxy CLI in ~/.local/bin/khroxy before enabling auto-update')
+        service, timer = _auto_units_content()
+        write_file(AUTOSERVICE_UNIT, service, 0o644)
+        write_file(AUTOTIMER_UNIT, timer, 0o644)
+        if systemctl('daemon-reload').returncode or systemctl('enable', '--now', 'khroxy-sub-update.timer').returncode:
+            fail('Could not enable the khroxy auto-update timer')
+    elif AUTOTIMER_UNIT.exists() or AUTOSERVICE_UNIT.exists():
+        result = systemctl('disable', '--now', 'khroxy-sub-update.timer')
+        if result.returncode:
+            fail('Could not stop the subscription timer')
+        AUTOTIMER_UNIT.unlink(missing_ok=True)
+        AUTOSERVICE_UNIT.unlink(missing_ok=True)
+        systemctl('daemon-reload')
+
+
+def set_auto(state, name, minutes):
+    if name not in state['subscriptions']:
+        fail('Unknown subscription')
+    if minutes != 0 and (not MIN_UPDATE_MINUTES <= minutes <= 10080 or minutes % 15):
+        fail('Auto-update interval must be a multiple of 15 minutes (15–10080), or 0 for off')
+    proposed = copy.deepcopy(state)
+    proposed['subscriptions'][name]['minutes'] = minutes
+    # Configure timer first so failure does not save an unsupported schedule.
+    sync_auto_timer(proposed)
+    write_file(STATE, serial(proposed))
+    print(f'Auto-update for {name}: ' + (f'every {minutes} minutes' if minutes else 'off'))
+
+
+def set_route(state, name, mode, via=None):
+    if name not in state['subscriptions']:
+        fail('Unknown subscription')
+    if mode not in ('direct', 'profile', 'any'):
+        fail('Choose direct, profile or any')
+    if mode == 'profile' and via not in state['profiles']:
+        fail('Selected fetch profile is not configured')
+    proposed = copy.deepcopy(state)
+    proposed['subscriptions'][name]['mode'] = mode
+    proposed['subscriptions'][name]['via'] = via if mode == 'profile' else None
+    write_file(STATE, serial(proposed))
+    print(f'Subscription {name}: fetching via {mode}' + (f' ({via})' if mode == 'profile' else ''))
+
+
+def cmd_update_feeds(name=None, due_only=False):
+    fd = lock()
+    try:
+        state = load()
+        if name is not None:
+            targets = [name]
+        else:
+            targets = sorted(state['subscriptions'])
+        failures = 0
+        for target in targets:
+            state = load()
+            if target not in state['subscriptions']:
+                fail('Unknown subscription')
+            sub = state['subscriptions'][target]
+            minutes = sub.get('minutes', 0)
+            if due_only and (not minutes or
+                (sub.get('last_ok') and time.time() - sub['last_ok'] < 60 * minutes)):
+                continue
+            try:
+                update_feed(state, target)
+            except (ValueError, OSError, subprocess.TimeoutExpired) as e:
+                failures += 1
+                # No URL, fetched credentials, or raw proxy configurations logged.
+                log_event('update_fail', target, _reason_code(e))
+                print(f'Failed to update subscription {target}: {e}', file=sys.stderr)
+        if failures:
+            fail(f'{failures} subscription(s) failed; existing data retained')
+    finally:
+        os.close(fd)
+
+
+# All uninstall paths are deliberately fixed, scoped to the current user.
+# Xray itself, codex-xray, foreign units and system settings are never owned.
+CLEANUP_FILES = ('state.json', 'runtime.json', '.lock', 'events.log')
+
+
+def cleanup_plan(purge=False):
+    return {
+        'service': str(UNIT),
+        'auto_service': str(AUTOSERVICE_UNIT),
+        'auto_timer': str(AUTOTIMER_UNIT),
+        'cli': str(Path.home() / '.local' / 'bin' / 'khroxy'),
+        'bashrc_hook': str(bashrc_path()),
+        'config': [str(ROOT / filename) for filename in CLEANUP_FILES] if purge else [],
+    }
+
+
+def cleanup_precheck(purge=False):
+    if bashrc_path().is_symlink():
+        fail('Refusing symlink ~/.bashrc; remove owned shell hook manually before uninstall')
+    binary = Path.home() / '.local' / 'bin' / 'khroxy'
+    for path in [UNIT, AUTOSERVICE_UNIT, AUTOTIMER_UNIT, binary, ROOT, *(ROOT / x for x in CLEANUP_FILES)]:
+        if path.is_symlink():
+            fail(f'Refusing symlink during uninstall: {path}')
+    for path in (AUTOSERVICE_UNIT, AUTOTIMER_UNIT):
+        if path.exists() and (not path.is_file() or not path.read_text().startswith('# Managed by khroxy\n')):
+            fail(f'Unknown subscription timer unit: {path}')
+    if UNIT.exists() and not UNIT.is_file():
+        fail('Unrecognized user unit type; refusing uninstall')
+    if UNIT.exists() and not UNIT.read_text().startswith('# Managed by khroxy\n'):
+        fail('Unrecognized khroxy.service owner; refusing uninstall')
+    if binary.exists() and (not binary.is_file() or
+                            'khroxy: local-only' not in binary.read_text(errors='replace')[:500]):
+        fail('CLI at expected path is not recognized as khroxy; refusing uninstall')
+    if ROOT.exists() and not ROOT.is_dir():
+        fail('Config path is not a directory; refusing uninstall')
+    if purge:
+        for name in CLEANUP_FILES:
+            target = ROOT / name
+            if target.exists() and not target.is_file():
+                fail(f'Unexpected managed file type: {target}')
+    return binary
+
+
+def cmd_uninstall(purge=False, dry_run=False, confirmation=None):
+    binary = cleanup_precheck(purge)
+    plan = cleanup_plan(purge)
+    print('Uninstall scope (current user only):')
+    print('  Stop/disable and remove owned service:', plan['service'])
+    print('  Stop/disable and remove owned auto-update timer and service units')
+    print('  Remove installed CLI:', plan['cli'])
+    print('  Remove only owned Bash startup hook if present:', plan['bashrc_hook'])
+    if purge:
+        print('  PURGE secrets and generated files:')
+        for path in plan['config']:
+            print('   ', path)
+        print('  Note: unlinking cannot guarantee secure erasure on SSDs/backups.')
+    else:
+        print('  Keep all saved profiles and application settings in:', ROOT)
+    print('  Unchanged: codex-xray, Xray executable, SSH, firewall, VPN, NetworkManager.')
+    if dry_run:
+        print('DRY RUN: nothing changed')
+        return
+    if purge:
+        if confirmation is None:
+            confirmation = input('Type PURGE KHROXY to confirm: ')
+        if confirmation != 'PURGE KHROXY':
+            fail('Purge confirmation not matched; nothing changed')
+    if AUTOTIMER_UNIT.exists() or AUTOSERVICE_UNIT.exists():
+        stopped_timer = systemctl('disable', '--now', 'khroxy-sub-update.timer')
+        if stopped_timer.returncode:
+            fail('Could not stop owned subscription timer; refusing uninstall')
+        result = systemctl('stop', 'khroxy-sub-update.service')
+        if result.returncode:
+            fail('Could not stop subscription update service; refusing file removal')
+        AUTOTIMER_UNIT.unlink(missing_ok=True)
+        AUTOSERVICE_UNIT.unlink(missing_ok=True)
+        systemctl('daemon-reload')
+    if UNIT.exists():
+        stopped = systemctl('disable', '--now', SERVICE)
+        if stopped.returncode:
+            fail('Could not stop/disable service; no files removed: ' + stopped.stderr.strip()[-250:])
+        if running():
+            fail('Service still active; refusing file removal')
+        UNIT.unlink()
+        reloaded = systemctl('daemon-reload')
+        if reloaded.returncode:
+            print('WARNING: Unit removed, but systemd daemon-reload failed: ' + reloaded.stderr.strip()[-250:])
+    elif running():
+        fail('A khroxy service is running but no owned unit exists; refusing uninstall')
+    if purge and ROOT.exists():
+        for name in CLEANUP_FILES:
+            (ROOT / name).unlink(missing_ok=True)
+        try:
+            ROOT.rmdir()
+        except OSError:
+            print('Unmanaged files remain in config directory; left untouched:', ROOT)
+    cmd_shell_disable()
+    if binary.exists():
+        binary.unlink()
+    print('Uninstall complete.' + (' Managed config purged.' if purge else ' Profiles retained.'))
+
+
+def _box(win, y, x, height, width, heading, active=False):
+    if height < 3 or width < 12:
+        return
+    style = curses.A_BOLD if active else curses.A_DIM
+    try:
+        win.attron(style)
+        win.addstr(y, x, '+' + '-' * (width - 2) + '+')
+        for iy in range(y + 1, y + height - 1):
+            win.addstr(iy, x, '|')
+            win.addstr(iy, x + width - 1, '|')
+        win.addstr(y + height - 1, x, '+' + '-' * (width - 2) + '+')
+        win.addstr(y, x + 2, ' ' + heading[:width - 7] + ' ')
+        win.attroff(style)
+    except curses.error:
+        pass
+
+
+def _cut(s, width):
+    s = str(s).replace('\n', ' ').replace('\r', ' ')
+    return (s[:width - 1] + '~') if len(s) > width else s
+
+
+def _line(win, y, x, s, width, attr=0):
+    if width < 1:
+        return
+    try:
+        win.addnstr(y, x, _cut(s, width), width, attr)
+    except curses.error:
+        pass
+
+
+
+# Keybindings are kept in one place and displayed on demand with `?`.
+# The main TUI intentionally has no shortcut-button footer.
+KEYBINDINGS = (
+    ('NAVIGATION', (
+        ('1 / 2 / 3 / 4', 'Open Profiles / Applications / Subscriptions / Logs'),
+        ('Tab / Shift+Tab', 'Next / previous screen'),
+        ('Up / Down or j / k', 'Move selection or scroll Logs'),
+        ('PgUp / PgDn / Home / End', 'Jump through the current screen'),
+        ('?', 'Open this keybindings screen'),
+        ('q', 'Quit khroxy'),
+    )),
+    ('PROFILES', (
+        ('Enter', 'Set selected profile as active (*)'),
+        ('p', 'Test selected profile (HTTPS latency)'),
+        ('P', 'Test all profiles in background'),
+        ('g', 'Select fastest recent working profile'),
+        ('a', 'Import share-link profile'),
+        ('n / v', 'Add subscription direct / through selected profile'),
+        ('d', 'Delete selected profile'),
+    )),
+    ('SUBSCRIPTIONS', (
+        ('a', 'Add direct subscription'),
+        ('u', 'Update selected subscription now'),
+        ('f', 'Choose fetch route: direct / profile / any'),
+        ('e', 'Set automatic update interval'),
+        ('d', 'Remove selected subscription'),
+    )),
+    ('APPLICATIONS', (
+        ('a', 'Add application'),
+        ('s', 'Assign a fixed profile, @active, or @fastest'),
+        ('t', 'Test application proxy connection'),
+        ('r', 'Run selected application'),
+        ('d', 'Remove selected application'),
+    )),
+    ('LOGS', (
+        ('Up / Down / PgUp / PgDn', 'Scroll log history'),
+        ('Home / End', 'Oldest / newest log entry'),
+    )),
+    ('SERVICE & SETTINGS', (
+        ('i', 'Install / start khroxy service'),
+        ('o', 'Stop khroxy service'),
+        ('w', 'Enable Bash command integration'),
+        ('x', 'Cleanup / uninstall / purge'),
+    )),
+)
+
+
+def _help_rows():
+    rows = []
+    for group, bindings in KEYBINDINGS:
+        rows.append(('heading', group))
+        rows.extend(('binding', key, description) for key, description in bindings)
+        rows.append(('blank',))
+    return rows[:-1]
+
+
+def _help_screen(win):
+    """Scrollable, keyboard-only help screen. Never changes application state."""
+    rows = _help_rows()
+    offset = 0
+    win.timeout(-1)
+    try:
+        while True:
+            height, width = win.getmaxyx()
+            win.erase()
+            if height < 9 or width < 34:
+                _line(win, 1, 2, 'KEYBINDINGS  [?]', width - 3, curses.A_BOLD)
+                _line(win, 3, 2, 'Resize terminal to read help', width - 3)
+                _line(win, max(0, height - 2), 2, '? / Esc / q  Return', width - 3)
+                viewport = 0
+            else:
+                _line(win, 1, 3, 'KHROXY  /  KEYBINDINGS', width - 6, curses.A_BOLD)
+                _line(win, 2, 3, 'Keyboard-only controls | changes nothing until you leave help', width - 6, curses.A_DIM)
+                _line(win, 3, 3, '-' * max(0, width - 6), width - 6, curses.A_DIM)
+                viewport = max(0, height - 7)
+                offset = min(offset, max(0, len(rows) - viewport))
+                for line_no, row in enumerate(rows[offset:offset + viewport]):
+                    y = 4 + line_no
+                    if row[0] == 'heading':
+                        _line(win, y, 3, row[1], width - 6, curses.A_BOLD)
+                    elif row[0] == 'binding':
+                        # Fixed-width key column; no clickable-looking buttons.
+                        key, description = row[1], row[2]
+                        keywidth = min(26, max(12, width // 3))
+                        _line(win, y, 5, key, keywidth - 1, curses.A_BOLD)
+                        _line(win, y, 5 + keywidth, description, max(0, width - keywidth - 9))
+                if len(rows) > viewport:
+                    _line(win, height - 3, 3,
+                          f'{offset + 1}-{min(offset + viewport, len(rows))} of {len(rows)}  |  Up/Down / PgUp/PgDn to scroll',
+                          width - 6, curses.A_DIM)
+                _line(win, height - 2, 3, '? / Esc / q / Enter  Return to khroxy', width - 6, curses.A_DIM)
+            win.refresh()
+            key = win.getch()
+            if key in (ord('?'), 27, ord('q'), ord('Q'), 10, 13, curses.KEY_ENTER):
+                return
+            if key in (curses.KEY_DOWN, ord('j')):
+                offset = min(max(0, len(rows) - viewport), offset + 1)
+            elif key in (curses.KEY_UP, ord('k')):
+                offset = max(0, offset - 1)
+            elif key == curses.KEY_NPAGE:
+                offset = min(max(0, len(rows) - viewport), offset + max(1, viewport - 2))
+            elif key == curses.KEY_PPAGE:
+                offset = max(0, offset - max(1, viewport - 2))
+            elif key in (curses.KEY_HOME, ord('g')):
+                offset = 0
+            elif key in (curses.KEY_END, ord('G')):
+                offset = max(0, len(rows) - viewport)
+    finally:
+        win.timeout(1000)
+
+
+def _input(win, prompt, secret=False):
+    height, width = win.getmaxyx()
+    if height < 9 or width < 45:
+        return None
+    maxlen = 16000 if secret else 200
+    values = []
+    win.timeout(-1)
+    curses.curs_set(1)
+    try:
+        while True:
+            text = ''.join(values)
+            display = '*' * len(text) if secret else text
+            win.move(height - 4, 0)
+            win.clrtoeol()
+            _line(win, height - 4, 2, prompt, width - 4, curses.A_BOLD)
+            win.move(height - 3, 0)
+            win.clrtoeol()
+            _line(win, height - 3, 2, '> ' + display[-(width - 7):], width - 4)
+            win.refresh()
+            ch = win.get_wch()
+            if ch in ('\n', '\r') or ch == curses.KEY_ENTER:
+                return text.strip()
+            if ch == '\x1b':
+                return None
+            if ch in ('\x7f', '\b') or ch == curses.KEY_BACKSPACE:
+                if values:
+                    values.pop()
+            elif isinstance(ch, str) and ch.isprintable() and len(values) < maxlen:
+                values.append(ch)
+    finally:
+        curses.curs_set(0)
+        win.timeout(1000)
+
+
+def _act(win, callback):
+    output = io.StringIO()
+    try:
+        with redirect_stdout(output), redirect_stderr(output):
+            callback()
+        lines = [x for x in output.getvalue().strip().splitlines() if x]
+        return _cut(lines[-1] if lines else 'Done', 180)
+    except (ValueError, OSError, KeyError, TypeError, subprocess.TimeoutExpired) as exc:
+        return 'ERROR: ' + _cut(str(exc), 170)
+
+
+def _tui_add_subscription(stdscr, mode='direct', via=None):
+    name = _input(stdscr, f'New {mode} subscription name:')
+    if not name:
+        return 'Subscription cancelled'
+    url = _input(stdscr, 'Paste HTTPS subscription URL (hidden):', secret=True)
+    if not url:
+        return 'Subscription cancelled'
+    def add():
+        fd = lock()
+        try: add_feed(load(), name, url, mode, via)
+        finally: os.close(fd)
+    return _act(stdscr, add)
+
+
+def _tui(stdscr):
+    curses.curs_set(0)
+    curses.noecho()
+    stdscr.keypad(True)
+    stdscr.timeout(1000)
+    screen, selections = 0, [0, 0, 0, 0]
+    message = 'Ready. Press ? for keybindings.'
+    update_thread = None
+    update_result = queue.SimpleQueue()
+    service_cache, service_stop = start_status_monitor()
+    labels = ('PROFILES', 'APPLICATIONS', 'SUBSCRIPTIONS', 'LOGS')
+    while True:
+        try:
+            message = update_result.get_nowait()
+            update_thread = None
+        except queue.Empty:
+            pass
+        state = load()
+        prof_names = sorted(state['profiles'])
+        sub_names = sorted(state['subscriptions'])
+        app_names = sorted(state['apps'])
+        log_lines = read_events(1000)
+        entries = (prof_names, app_names, sub_names, log_lines)
+        h, w = stdscr.getmaxyx()
+        stdscr.erase()
+        if h < 18 or w < 54:
+            _line(stdscr, 1, 2, 'khroxy | terminal too small (min 54 x 18)', w - 3)
+            _line(stdscr, 3, 2, 'Resize terminal, or press q to quit.', w - 3)
+            stdscr.refresh()
+            if stdscr.getch() in (ord('q'), ord('Q')) and (update_thread is None or not update_thread.is_alive()):
+                service_stop.set()
+                return
+            continue
+        visible = max(1, h - 10)
+        selections[screen] = max(0, min(selections[screen], max(0, len(entries[screen])-1)))
+        _line(stdscr, 0, 2, 'khroxy  /  private Xray manager', w - 4, curses.A_BOLD)
+        status = service_cache['value']
+        if update_thread is not None and update_thread.is_alive(): status += ' / WORKING'
+        _line(stdscr, 1, 2,
+              f'Service: {status}  |  Profiles: {len(prof_names)}  Subs: {len(sub_names)}  Apps: {len(app_names)}',
+              w - 4, curses.A_DIM)
+        # Full-screen section navigation, no bottom action-button strip.
+        _line(stdscr, 2, 2, f'{screen+1}/4  {labels[screen]}   |   Tab: next screen    ?: keybindings',
+              w - 4, curses.A_BOLD)
+        if screen == 3:
+            _box(stdscr, 4, 1, h - 8, w - 2, 'LOG HISTORY')
+            view = h - 10
+            begin = max(0, min(selections[3] - view + 1, len(log_lines) - view))
+            for i, line in enumerate(log_lines[begin:begin+view]):
+                sel = begin + i == selections[3]
+                _line(stdscr, 6+i, 3, ('> ' if sel else '  ') + line,
+                      w - 6, curses.A_REVERSE if sel else curses.A_DIM)
+            if not log_lines:
+                _line(stdscr, 6, 3, 'No events recorded yet.', w - 6, curses.A_DIM)
+        else:
+            wide = w >= 84
+            list_width = max(26, (w - 4) * 3 // 5) if wide else w - 2
+            _box(stdscr, 4, 1, h - 8, list_width, labels[screen] + ' / SELECT')
+            if wide: _box(stdscr, 4, list_width + 1, h - 8, w - list_width - 2, 'DETAILS')
+            names = entries[screen]
+            begin = max(0, selections[screen] - visible + 1)
+            for idx, name in enumerate(names[begin:begin+visible]):
+                selected = begin + idx == selections[screen]
+                cursor = '>' if selected else ' '
+                if screen == 0:
+                    profile = state['profiles'].get(name, {})
+                    selected_name = (state.get('fastest_profile') if state.get('selection_mode') == 'fastest'
+                                     else state.get('active_profile'))
+                    star = '*' if name == selected_name else ' '
+                    health = state.get('health', {}).get(name, {})
+                    latency = f'{health["ms"]}ms' if health.get('ok') else ('FAIL' if health else '--')
+                    desc = f'{cursor}{star} {name}  [{profile.get("protocol", "?")}]  {latency}'
+                elif screen == 1:
+                    app = state['apps'][name]
+                    desc = f'{cursor} {name}  :{app["port"]}  ->  {app["profile"]}'
+                else:
+                    feed = state['subscriptions'].get(name, {})
+                    auto = f'{feed.get("minutes")}m' if feed.get('minutes') else 'manual'
+                    desc = f'{cursor} {name}  [{feed.get("mode", "direct")}] {auto}  {len(feed.get("profiles", []))} nodes'
+                _line(stdscr, 6+idx, 3, desc, list_width - 5, curses.A_REVERSE if selected else 0)
+            if wide:
+                x = list_width + 3
+                dw = w - x - 3
+                name = names[selections[screen]] if names else None
+                details = []
+                if screen == 0 and name:
+                    prof = state['profiles'][name]
+                    stream = prof.get('streamSettings', {})
+                    endpoint = (prof.get('settings', {}).get('vnext') or
+                                prof.get('settings', {}).get('servers') or [{}])[0]
+                    if not isinstance(endpoint, dict): endpoint = {}
+                    health = state.get('health', {}).get(name, {})
+                    owners = [sub for sub, item in state['subscriptions'].items() if name in item.get('profiles', [])]
+                    selected_name = (state.get('fastest_profile') if state.get('selection_mode') == 'fastest' else state.get('active_profile'))
+                    details = [f'Profile: {name}', f'Selected: {"YES *" if name == selected_name else "No"}',
+                               f'Protocol: {prof.get("protocol", "unknown")}',
+                               f'Server: {endpoint.get("address", "unknown")}',
+                               f'Port: {endpoint.get("port", "unknown")}',
+                               f'Network: {stream.get("network", "tcp")}',
+                               f'Security: {stream.get("security", "none")}',
+                               f'Test: {health.get("ms")} ms' if health.get('ok') else
+                                   ('Test: FAIL' if health else 'Test: not tested'),
+                               f'Fastest: {"YES" if name == state.get("fastest_profile") else "No"}',
+                               f'Subscription: {", ".join(owners) or "manual"}',
+                               'Apps using profile:']
+                    details += [f'  {app}' for app, a in state['apps'].items()
+                                if a['profile'] == name or
+                                (a['profile'] in DYNAMIC_ROUTES and
+                                 (state.get('active_profile') if a['profile'] == '@active' else
+                                  state.get('fastest_profile')) == name)] or ['  none']
+                    details += ['', '* marks active; > marks cursor']
+                elif screen == 1 and name:
+                    app = state['apps'][name]
+                    details = [f'Application: {name}', f'Assignment: {app["profile"]}',
+                               f'Listener: 127.0.0.1:{app["port"]}',
+                               f'Command: {shlex.join(app["command"])}',
+                               'Routing changes require', 'a working khroxy service.']
+                    try: details.insert(2, 'Resolved: ' + resolve_profile(state, app['profile']))
+                    except ValueError: details.insert(2, 'Resolved: OFFLINE (no route)')
+                elif screen == 2 and name:
+                    sub = state['subscriptions'][name]
+                    last = (datetime.fromtimestamp(sub['last_ok'], timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+                            if sub.get('last_ok') else 'Never')
+                    details = [f'Subscription: {name}', 'URL: [hidden]',
+                               f'Fetch mode: {sub.get("mode", "direct")}',
+                               f'Via: {sub.get("via") or "n/a"}',
+                               f'Imported: {len(sub.get("profiles", []))}',
+                               f'Skipped: {sub.get("last_skipped", 0)}',
+                               f'Stale: {len(sub.get("stale", []))}',
+                               f'Auto update: {sub.get("minutes") or "off"}',
+                               f'Last success: {last}']
+                for i, item in enumerate(details[:h - 11]):
+                    _line(stdscr, 6+i, x, item, dw, curses.A_DIM if i not in (0, 1) else curses.A_BOLD)
+            if not names: _line(stdscr, 6, 3, 'Empty. Use ? for available actions.', list_width - 5, curses.A_DIM)
+        _line(stdscr, h-3, 2, f'{len(entries[screen])} entries  |  scroll with Up/Down or j/k', w-4, curses.A_DIM)
+        _line(stdscr, h-2, 2, message, w-4, curses.A_DIM)
+        stdscr.refresh()
+        key = stdscr.getch()
+        if key == -1: continue
+        if key in (ord('q'), ord('Q')):
+            if update_thread is not None and update_thread.is_alive():
+                message = 'Operation in progress; wait for completion before quitting'
+                continue
+            service_stop.set(); return
+        if key == ord('?'):
+            _help_screen(stdscr)
+        elif key in (ord('1'), ord('2'), ord('3'), ord('4')):
+            screen = key - ord('1')
+        elif key in (9, curses.KEY_RIGHT):
+            screen = (screen + 1) % 4
+        elif key in (curses.KEY_BTAB, curses.KEY_LEFT):
+            screen = (screen - 1) % 4
+        elif key in (curses.KEY_UP, ord('k')):
+            selections[screen] = max(0, selections[screen] - 1)
+        elif key in (curses.KEY_DOWN, ord('j')):
+            selections[screen] = min(max(0, len(entries[screen])-1), selections[screen] + 1)
+        elif key == curses.KEY_HOME:
+            selections[screen] = 0
+        elif key == curses.KEY_END:
+            selections[screen] = max(0, len(entries[screen])-1)
+        elif key == curses.KEY_PPAGE:
+            selections[screen] = max(0, selections[screen] - visible)
+        elif key == curses.KEY_NPAGE:
+            selections[screen] = min(max(0, len(entries[screen])-1), selections[screen] + visible)
+        elif update_thread is not None and update_thread.is_alive():
+            message = 'Operation running; navigation works, other actions disabled'
+        elif key == ord('b'):
+            screen = 2 if screen == 0 else 0
+        elif key in (10, 13, curses.KEY_ENTER) and screen == 0 and prof_names:
+            message = _act(stdscr, lambda: select_active(prof_names[selections[0]]))
+        elif key in (ord('p'), ord('P')) and screen == 0 and prof_names:
+            names = prof_names if key == ord('P') else [prof_names[selections[0]]]
+            def probe_worker(names=names):
+                try:
+                    with redirect_stdout(io.StringIO()) as _:
+                        test_profiles(names, select_fastest=True)
+                    update_result.put('Test complete; fastest = ' + str(load().get('fastest_profile') or 'none'))
+                except (ValueError, OSError, subprocess.TimeoutExpired) as exc:
+                    update_result.put('ERROR: ' + _cut(str(exc), 120))
+            update_thread = threading.Thread(target=probe_worker, daemon=False, name='khroxy-probe')
+            update_thread.start()
+            message = f'Testing {len(names)} profile(s); refreshes in background'
+        elif key == ord('g') and screen == 0:
+            message = _act(stdscr, activate_fastest)
+        elif key == ord('a') and screen != 3:
+            if screen == 2:
+                message = _tui_add_subscription(stdscr, 'direct')
+            elif screen == 0:
+                name = _input(stdscr, 'Profile name (Esc cancels):')
+                if name:
+                    link = _input(stdscr, 'Paste share link (hidden on screen; Esc cancels):', secret=True)
+                    if link:
+                        def add_prof():
+                            check_name(name)
+                            if name in load()['profiles']: fail('Profile already exists')
+                            outbound = parse_share(link)
+                            fd = lock()
+                            try:
+                                st = load(); st['profiles'][name] = outbound
+                                write_file(STATE, serial(st))
+                            finally: os.close(fd)
+                            print(f'Imported {name}; no connections switched')
+                        message = _act(stdscr, add_prof)
+            else:
+                name = _input(stdscr, 'App name:')
+                if name:
+                    default = state.get('active_profile') or (prof_names[selections[0]] if prof_names else '')
+                    profile = _input(stdscr, f'Profile name (suggested: {default}):')
+                    if profile == '': profile = default
+                    if profile is not None:
+                        cmd = _input(stdscr, 'Launch command (e.g. kilo):')
+                        if cmd:
+                            def add_app():
+                                fd = lock()
+                                try: cmd_app_add(load(), name, profile, cmd)
+                                finally: os.close(fd)
+                            message = _act(stdscr, add_app)
+        elif key == ord('n') and screen == 0:
+            message = _tui_add_subscription(stdscr, 'direct')
+        elif key == ord('v') and screen == 0:
+            if not prof_names:
+                message = 'Import/select a profile first, or press n for a direct subscription'
+            else:
+                via = prof_names[selections[0]]
+                message = _tui_add_subscription(stdscr, 'profile', via)
+        elif key == ord('d') and screen != 3:
+            names = entries[screen]
+            if names:
+                name = names[selections[screen]]
+                sure = _input(stdscr, f'Type DELETE {name} to remove {"subscription" if screen == 2 else "profile" if screen == 0 else "app"}:')
+                if sure == 'DELETE ' + name:
+                    def remove():
+                        fd = lock()
+                        try:
+                            st = load(); proposed = copy.deepcopy(st)
+                            if screen == 2:
+                                remove_feed(st, name)
+                                sync_auto_timer(load())
+                            elif screen == 0:
+                                if any(resolve_profile(st, a['profile']) == name for a in st['apps'].values()):
+                                    fail('Profile is assigned to an application')
+                                if any(name in sub['profiles'] for sub in st['subscriptions'].values()):
+                                    fail('Subscription-owned profile; remove subscription instead')
+                                if any(sub.get('via') == name and sub['mode'] == 'profile' for sub in st['subscriptions'].values()):
+                                    fail('Profile is configured as a subscription fetch route')
+                                del proposed['profiles'][name]
+                                proposed.get('health', {}).pop(name, None)
+                                if proposed.get('active_profile') == name: proposed['active_profile'] = None
+                                if proposed.get('fastest_profile') == name: proposed['fastest_profile'] = None
+                                if serial(build_runtime(st)) != serial(build_runtime(proposed)):
+                                    commit(st, proposed)
+                                else: write_file(STATE, serial(proposed))
+                            else:
+                                del proposed['apps'][name]; commit(st, proposed)
+                            print('Removed ' + name)
+                        finally: os.close(fd)
+                    message = _act(stdscr, remove)
+                else: message = 'Deletion cancelled'
+        elif key == ord('u') and screen == 2 and sub_names:
+            if update_thread is not None and update_thread.is_alive():
+                message = 'Another fetch is in progress'
+                continue
+            subname = sub_names[selections[2]]
+            def fetch_worker(selected=subname):
+                try:
+                    cmd_update_feeds(selected)
+                    update_result.put('Updated ' + selected + ' (see Logs)')
+                except (ValueError, OSError, subprocess.TimeoutExpired) as exc:
+                    update_result.put('ERROR: ' + _cut(str(exc), 125))
+            update_thread = threading.Thread(target=fetch_worker, name='khroxy-fetch', daemon=False)
+            update_thread.start()
+            message = 'Fetching ' + subname + '; logs refresh while downloading'
+
+        elif key == ord('f') and screen == 2 and sub_names:
+            subname = sub_names[selections[2]]
+            mode = _input(stdscr, 'Fetch via direct / profile / any:')
+            if mode:
+                via = _input(stdscr, 'Profile name:') if mode == 'profile' else None
+                def change_route():
+                    fd = lock()
+                    try: set_route(load(), subname, mode, via)
+                    finally: os.close(fd)
+                message = _act(stdscr, change_route)
+        elif key == ord('e') and screen == 2 and sub_names:
+            subname = sub_names[selections[2]]
+            interval = _input(stdscr, 'Auto-update minutes (0=off, >=15):')
+            if interval is not None:
+                def change_auto():
+                    fd = lock()
+                    try: set_auto(load(), subname, int(interval))
+                    finally: os.close(fd)
+                message = _act(stdscr, change_auto)
+        elif key == ord('s') and screen == 1 and app_names:
+            app = app_names[selections[1]]
+            profile = _input(stdscr, f'Assign profile to {app}:')
+            if profile:
+                def switch():
+                    fd = lock()
+                    try: cmd_switch(load(), app, profile)
+                    finally: os.close(fd)
+                message = _act(stdscr, switch)
+        elif key == ord('t') and screen == 1 and app_names:
+            app = app_names[selections[1]]
+            if service_cache['value'] == 'ACTIVE':
+                message = _act(stdscr, lambda: print(app, *check_proxy(state['apps'][app]['port'])))
+            else:
+                message = 'Service not confirmed active; press i to start or see systemd status'
+        elif key == ord('w'):
+            message = _act(stdscr, cmd_shell_enable)
+        elif key == ord('i'):
+            message = _act(stdscr, cmd_unit)
+        elif key == ord('o'):
+            def stop_service():
+                if not CONTAINER_MODE and (not UNIT.exists() or not UNIT.read_text().startswith('# Managed by khroxy\n')):
+                    fail('No managed khroxy service unit found')
+                result = systemctl('stop', SERVICE)
+                if result.returncode: fail(result.stderr.strip())
+                print('khroxy stopped; profiles retained')
+            message = _act(stdscr, stop_service)
+        elif key == ord('r') and screen == 1 and app_names:
+            app = app_names[selections[1]]
+            curses.endwin()
+            cmd_run(state, app, [])
+        elif key == ord('x'):
+            choice = _input(stdscr, 'Cleanup: v=preview, u=uninstall (keep profiles), p=purge, Esc=cancel:')
+            if choice in ('v', 'V'):
+                message = 'Preview: khroxy uninstall --dry-run [--purge]'
+            elif choice in ('u', 'U'):
+                sure = _input(stdscr, 'Type UNINSTALL to stop khroxy and remove its CLI:')
+                if sure == 'UNINSTALL':
+                    result = _act(stdscr, cmd_uninstall)
+                    if not result.startswith('ERROR:'):
+                        curses.endwin(); print(result); return
+                    message = result
+                else:
+                    message = 'Cleanup cancelled'
+            elif choice in ('p', 'P'):
+                sure = _input(stdscr, 'Type PURGE KHROXY to delete stored profiles and credentials:')
+                if sure == 'PURGE KHROXY':
+                    result = _act(stdscr, lambda: cmd_uninstall(purge=True, confirmation=sure))
+                    if not result.startswith('ERROR:'):
+                        curses.endwin(); print(result); return
+                    message = result
+                else:
+                    message = 'Purge cancelled'
+            else:
+                message = 'Cleanup cancelled'
+        else:
+            message = 'No action for this key in the selected panel'
+
+
+def cmd_tui():
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        fail('Interactive TUI requires a terminal; use khroxy --help for CLI commands')
+    curses.wrapper(_tui)
+
+
+def cli():
+    if os.geteuid() == 0:
+        fail('Do not run khroxy with sudo; it uses your per-user Xray service')
+    parser = argparse.ArgumentParser(description='Local per-app Xray manager; no root required')
+    sub = parser.add_subparsers(dest='verb')
+    sub.add_parser('init')
+    p = sub.add_parser('import', help='Paste a private share link securely')
+    p.add_argument('name')
+    p.add_argument('--allow-plaintext', action='store_true')
+    sub.add_parser('profiles')
+    p = sub.add_parser('select', help='Mark an active (*) profile'); p.add_argument('name')
+    p = sub.add_parser('ping', help='Probe selected profile(s) through Xray'); p.add_argument('name', nargs='?'); p.add_argument('--all', action='store_true')
+    p = sub.add_parser('fastest', help='Select best recent healthy profile, optionally test first'); p.add_argument('--test', action='store_true')
+    sub.add_parser('subs', help='List subscriptions (URLs redacted)')
+    sub.add_parser('logs', help='Show recent sanitized subscription events')
+    p = sub.add_parser('sub-add', help='Save an HTTPS subscription URL securely')
+    p.add_argument('name'); p.add_argument('--mode', choices=('direct', 'profile', 'any'), default='direct'); p.add_argument('--via'); p.add_argument('--allow-plaintext', action='store_true')
+    p = sub.add_parser('sub-update', help='Fetch and update subscriptions, or --due for timer')
+    p.add_argument('name', nargs='?'); p.add_argument('--due', action='store_true')
+    p = sub.add_parser('sub-remove'); p.add_argument('name')
+    p = sub.add_parser('sub-route'); p.add_argument('name'); p.add_argument('--mode', choices=('direct', 'profile', 'any'), required=True); p.add_argument('--via')
+    p = sub.add_parser('sub-auto'); p.add_argument('name'); p.add_argument('--minutes', type=int, required=True)
+    p = sub.add_parser('remove-profile'); p.add_argument('name')
+    p = sub.add_parser('app-add'); p.add_argument('name'); p.add_argument('--profile', required=True); p.add_argument('--command', required=True)
+    p = sub.add_parser('remove-app'); p.add_argument('name')
+    sub.add_parser('apps')
+    p = sub.add_parser('switch'); p.add_argument('app'); p.add_argument('profile')
+    p = sub.add_parser('run'); p.add_argument('app'); p.add_argument('extra', nargs=argparse.REMAINDER)
+    p = sub.add_parser('test'); p.add_argument('app')
+    p = sub.add_parser('service-env'); p.add_argument('app')
+    sub.add_parser('shell-enable', help='Opt in to direct app commands in new Bash shells')
+    sub.add_parser('shell-disable', help='Remove owned Bash startup hook')
+    p = sub.add_parser('shell-init', help='Print per-app Bash functions for eval')
+    p.add_argument('shell', nargs='?', default='bash', choices=('bash',))
+    sub.add_parser('install')
+    sub.add_parser('status')
+    sub.add_parser('container-status', help='Check contained Xray gateway without systemd')
+    sub.add_parser('menu', help='Launch live terminal UI (alias of tui)')
+    sub.add_parser('tui')
+    p = sub.add_parser('uninstall', help='Remove managed service and CLI; keep profiles unless --purge')
+    p.add_argument('--purge', action='store_true')
+    p.add_argument('--dry-run', action='store_true')
+    args = parser.parse_args()
+    if args.verb == 'select': return select_active(args.name)
+    if args.verb == 'ping':
+        if args.all and args.name: fail('Specify name or --all')
+        return test_profiles(sorted(load()['profiles']) if args.all else [args.name] if args.name else [], select_fastest=True)
+    if args.verb == 'fastest':
+        if args.test: test_profiles(sorted(load()['profiles']), select_fastest=True)
+        return activate_fastest()
+    if args.verb == 'shell-init':
+        return cmd_shell_init(args.shell)
+    if args.verb == 'shell-enable':
+        return cmd_shell_enable()
+    if args.verb == 'shell-disable':
+        return cmd_shell_disable()
+    if args.verb == 'run':
+        return cmd_run(load(), args.app, args.extra)
+    if args.verb == 'service-env':
+        state = load()
+        if args.app not in state['apps']:
+            fail('Unknown app')
+        proxy = f'http://127.0.0.1:{state["apps"][args.app]["port"]}'
+        print('# Paste these lines into a systemd --user service drop-in and restart that service')
+        for name in ('HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','http_proxy','https_proxy','all_proxy'):
+            print(f'Environment="{name}={proxy}"')
+        print('Environment="NODE_USE_ENV_PROXY=1"')
+        print(f'Environment="NO_PROXY={DEFAULT_NO_PROXY}"')
+        print(f'Environment="no_proxy={DEFAULT_NO_PROXY}"')
+        return
+    if args.verb == 'sub-update':
+        if args.due and args.name: fail('Use a subscription name or --due, not both')
+        return cmd_update_feeds(args.name, due_only=args.due)
+    if args.verb == 'subs':
+        return show_feeds(load())
+    if args.verb == 'logs':
+        print('\n'.join(read_events(25)) or 'No events yet')
+        return
+    if args.verb == 'container-status':
+        print('Container mode:', CONTAINER_MODE, 'gateway:', 'active' if running() else 'offline', 'port:', GATEWAY_PORT)
+        return
+    if args.verb == 'status':
+        print('Service:', 'active' if running() else 'inactive')
+        show_apps(load())
+        return
+    if args.verb == 'profiles':
+        return show_profiles(load())
+    if args.verb == 'apps':
+        return show_apps(load())
+    if args.verb == 'test':
+        state = load()
+        if args.app not in state['apps']:
+            fail('Unknown app')
+        if not running():
+            fail('Service inactive')
+        ok, why = check_proxy(state['apps'][args.app]['port'])
+        print(args.app, 'PASS' if ok else 'FAIL', why)
+        if not ok:
+            sys.exit(1)
+        return
+    if args.verb == 'install':
+        return cmd_unit()
+    if args.verb == 'uninstall':
+        return cmd_uninstall(purge=args.purge, dry_run=args.dry_run)
+    if args.verb in (None, 'menu', 'tui'):
+        return cmd_tui()
+    fd = lock()
+    try:
+        state = load()
+        if args.verb == 'init':
+            if STATE.exists():
+                print('Already initialized:', STATE)
+            else:
+                write_file(STATE, serial(state)); print('Created', STATE)
+        elif args.verb == 'import': cmd_import(state, args.name, args.allow_plaintext)
+        elif args.verb == 'sub-add':
+            url = (getpass.getpass('HTTPS subscription URL (hidden): ') if sys.stdin.isatty()
+                   else sys.stdin.readline().strip())
+            add_feed(state, args.name, url, args.mode, args.via, args.allow_plaintext)
+        elif args.verb == 'sub-remove':
+            remove_feed(state, args.name)
+            sync_auto_timer(load())
+        elif args.verb == 'sub-route':
+            set_route(state, args.name, args.mode, args.via)
+        elif args.verb == 'sub-auto':
+            set_auto(state, args.name, args.minutes)
+        elif args.verb == 'app-add': cmd_app_add(state, args.name, args.profile, args.command)
+        elif args.verb == 'switch': cmd_switch(state, args.app, args.profile)
+        elif args.verb == 'remove-profile':
+            if args.name not in state['profiles']: fail('Unknown profile')
+            if any(resolve_profile(state, a['profile']) == args.name for a in state['apps'].values()):
+                fail('Profile is still assigned to an app')
+            if any(args.name in sub['profiles'] for sub in state['subscriptions'].values()):
+                fail('Profile is owned by subscription; remove subscription instead')
+            if any(sub.get('via') == args.name and sub['mode'] == 'profile' for sub in state['subscriptions'].values()):
+                fail('Profile is configured as subscription fetch route')
+            proposed = copy.deepcopy(state); del proposed['profiles'][args.name]
+            proposed.get('health', {}).pop(args.name, None)
+            if proposed.get('active_profile') == args.name: proposed['active_profile'] = None
+            if proposed.get('fastest_profile') == args.name: proposed['fastest_profile'] = None
+            if serial(build_runtime(state)) != serial(build_runtime(proposed)):
+                commit(state, proposed)
+            else: write_file(STATE, serial(proposed))
+            print('Removed', args.name)
+        elif args.verb == 'remove-app':
+            if args.name not in state['apps']: fail('Unknown app')
+            proposed = copy.deepcopy(state); del proposed['apps'][args.name]
+            commit(state, proposed); print('Removed', args.name)
+    finally:
+        os.close(fd)
+
+
+if __name__ == '__main__':
+    try:
+        cli()
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        print('khroxy:', error, file=sys.stderr)
+        sys.exit(1)

@@ -1,0 +1,50 @@
+# LOCAL DEVELOPMENT PREVIEW: not verified against the user's Debian Docker daemon.
+# Never use network_mode: host; the network guard relies on its own namespace.
+services:
+  khroxy:
+    build:
+      context: .
+      dockerfile: docker/Containerfile
+      args:
+        AGENT_UID: ${AGENT_UID:-1000}
+        CAVEMAN_SUITE: "none"
+    image: localhost/khroxy-ai:0.9.1
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN, SETUID, SETGID, CHOWN]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=32m
+      - /run:rw,nosuid,nodev,size=4m
+    ports:
+      - "127.0.0.1:20819:20819/tcp"
+    networks:
+      - khroxy_private
+    volumes:
+      - type: bind
+        source: ${KHROXY_PROJECTS:?Use install.sh; set an explicit projects directory for advanced Compose use}
+        target: /workspace
+        bind:
+          create_host_path: false
+      - type: volume
+        source: agent_home
+        target: /home/agent
+      - type: volume
+        source: config
+        target: /home/khroxy/.config/khroxy
+    environment:
+      KHROXY_CONTAINER: "1"
+      KHROXY_HOST_NETNS: ${KHROXY_HOST_NETNS:?Use install.sh; host netns fingerprint is required}
+      KHROXY_TRUSTED_LAN_TCP: ${KHROXY_TRUSTED_LAN_TCP:-}
+    restart: unless-stopped
+networks:
+  khroxy_private:
+    name: khroxy_private
+    driver: bridge
+volumes:
+  config:
+    external: true
+    name: khroxy_config
+  agent_home:
+    external: true
+    name: khroxy_agent_home

@@ -1,0 +1,35 @@
+# Local workspace configuration and generated runtime data (never commit secrets).
+/workspace.json
+/workspace-settings.json
+/compose.local.yaml
+**/.env
+**/.env.*
+!**/.env.example
+**/.codex/
+**/.agents/
+**/.aws/
+**/.ssh/
+**/.config/khroxy/
+**/auth.json
+**/credentials.json
+**/state.json
+**/runtime.json
+*.pem
+*.key
+*.log
+*.pid
+*.new
+*.bak
+__pycache__/
+*.py[cod]
+/docker/xray
+/dist/
+/build/
+
+# Experimental packages and v0.1.0 local databases/artifacts.
+/windscribe/*.deb
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+/coverage/

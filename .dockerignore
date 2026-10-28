@@ -1,0 +1,14 @@
+# Allowlist the build context: project data and authentication never enter it.
+**
+!khroxy
+!docker
+docker/**
+!docker/Containerfile
+!docker/Dockerfile
+!docker/xray
+!docker/network-guard.sh
+!docker/entrypoint.sh
+!docker/scheduler.sh
+!docker/verify-isolation.py
+!docker/caveman.py
+!docker/runtime-paths.py
