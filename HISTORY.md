@@ -20,6 +20,7 @@ No new tags have been created.
 - `5da23f2f88ab54d99d164709e41d4ef48700855b`: Add rootless runtime supervisor with private IPC and recovery.
 - `1b643a9b871d61ff52b350bd45de6acecd33542d`: Add loopback listeners, explicit routing and native static DNS.
 - `8b7e32cd66ecc169e63c0c7bb66c8830988a0068`: Add bounded resumable explicit-candidate TCP scanning.
+- `6e4fad6fb9f01d02ba075390eff8767aa817ca63`: Add authenticated local API, automation, exports and shell documentation.
 
 The initial snapshot includes earlier standalone stabilization work, with
 Windscribe experiments and internal review reports excluded. The portable
