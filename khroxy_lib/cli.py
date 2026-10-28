@@ -6,8 +6,12 @@ from .storage import Store
 
 
 def dispatch(app, argv):
-    if not argv or argv[0] not in ('storage', 'profile', 'import-data', 'engine'):
+    if not argv or argv[0] not in ('storage', 'profile', 'import-data', 'engine', 'test-profiles'):
         return False
+    if argv[0] == 'test-profiles':
+        from .testing import cli
+        cli(app, argv[1:])
+        return True
     if argv[0] == 'engine':
         from .engines import cli
         cli(app, argv[1:])
